@@ -65,6 +65,7 @@ export class ExportJob {
     this.confirmReferences = confirmReferences;
     this.pauseRequested = false;
     this.controller = null;
+    this.jobId = null;
   }
 
   requestPause() {
@@ -119,7 +120,10 @@ export class ExportJob {
         : [
             {
               code: ERROR_CODES.INVALID_RESPONSE,
-              message: '关注列表达到安全页数上限',
+              message:
+                result.reason === 'followed_count_mismatch'
+                  ? '关注列表实际数量与服务端总数不一致'
+                  : '关注列表达到安全页数上限',
               phase: 'followed',
               retryable: true,
             },
@@ -143,7 +147,10 @@ export class ExportJob {
           fetchStatus = 'partial';
           error = {
             code: ERROR_CODES.INVALID_RESPONSE,
-            message: `#${pid} 评论达到安全页数上限`,
+            message:
+              result.reason === 'comment_count_mismatch'
+                ? `#${pid} 评论实际数量与服务端总数不一致`
+                : `#${pid} 评论达到安全页数上限`,
             pid,
             phase: 'comments',
             retryable: true,
@@ -213,6 +220,7 @@ export class ExportJob {
       job.options = options;
       job.errors = [];
     }
+    this.jobId = job.id;
 
     try {
       await this.saveState(job, JOB_STATES.PLANNING);

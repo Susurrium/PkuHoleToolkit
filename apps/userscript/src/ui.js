@@ -315,6 +315,7 @@ export function mountToolkit({
         !result.manifest.complete,
       );
     } catch (error) {
+      activeJobId = activeJobId || activeJob?.jobId || null;
       setMessage(error.message || '导出失败', true);
       statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
     } finally {
@@ -391,6 +392,7 @@ export function mountToolkit({
         !result.paused && (result.audit.failed > 0 || result.audit.unknown > 0),
       );
     } catch (error) {
+      activeJobId = activeJobId || activeJob?.jobId || null;
       setMessage(error.message || '导入失败', true);
       statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
     } finally {

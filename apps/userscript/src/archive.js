@@ -51,14 +51,31 @@ export function legacyArchiveToItems(value) {
 }
 
 export function validateArchiveV2(manifest, data) {
-  if (!manifest || manifest.schemaVersion !== 2) {
-    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 schemaVersion 不是 2');
+  if (
+    !manifest ||
+    manifest.schemaVersion !== 2 ||
+    typeof manifest.toolVersion !== 'string' ||
+    typeof manifest.runId !== 'string' ||
+    typeof manifest.exportedAt !== 'string' ||
+    typeof manifest.complete !== 'boolean' ||
+    !manifest.counts ||
+    !Array.isArray(manifest.errors)
+  ) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 manifest 不符合 v2 协议');
   }
   if (!data || !Array.isArray(data.items)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档缺少 data.items');
   }
+  const sources = new Set(['followed', 'referenced', 'explicit', 'legacy-v1']);
   for (const item of data.items) {
-    if (!item || !PID_PATTERN.test(String(item.pid)) || !item.hole || !Array.isArray(item.comments)) {
+    if (
+      !item ||
+      !PID_PATTERN.test(String(item.pid)) ||
+      !sources.has(item.source) ||
+      !['ok', 'partial'].includes(item.fetchStatus) ||
+      !item.hole ||
+      !Array.isArray(item.comments)
+    ) {
       throw new AppError(ERROR_CODES.INVALID_INPUT, '归档中存在无效的洞记录');
     }
   }

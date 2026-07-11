@@ -117,3 +117,51 @@ test('follow operation performs one POST and verifies final state', async () => 
   assert.equal(calls.filter((call) => call.method === 'POST').length, 1);
   assert.equal(detailCalls, 2);
 });
+
+test('ambiguous POST failure is reconciled with one final read and no repeated write', async () => {
+  let detailCalls = 0;
+  let postCalls = 0;
+  const scheduler = {
+    async requestJson(url, options) {
+      if (url.includes('/pku/345678/')) {
+        detailCalls += 1;
+        return { code: 20000, data: { pid: 345678, is_follow: detailCalls > 1 ? 1 : 0 } };
+      }
+      if (options.method === 'POST') {
+        postCalls += 1;
+        const error = new Error('response lost');
+        error.code = ERROR_CODES.NETWORK_ERROR;
+        throw error;
+      }
+      throw new Error('unexpected request');
+    },
+  };
+  const api = new TreeholeApi({
+    scheduler,
+    credentialsProvider: async () => ({ token: 't', uuid: 'u' }),
+  });
+  assert.deepEqual(await api.followHole('345678'), {
+    status: 'followed_reconciled',
+    pid: '345678',
+  });
+  assert.equal(postCalls, 1);
+  assert.equal(detailCalls, 2);
+});
+
+test('pagination reports incomplete data when the service total does not match', async () => {
+  const scheduler = {
+    async requestJson() {
+      return {
+        code: 20000,
+        data: { data: [{ pid: 123456 }], total: 2, current_page: 1, last_page: 1 },
+      };
+    },
+  };
+  const api = new TreeholeApi({
+    scheduler,
+    credentialsProvider: async () => ({ token: 't', uuid: 'u' }),
+  });
+  const result = await api.getAllFollowed();
+  assert.equal(result.complete, false);
+  assert.equal(result.reason, 'followed_count_mismatch');
+});

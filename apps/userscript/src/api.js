@@ -136,7 +136,13 @@ export class TreeholeApi {
       }
       onPage({ page, count: seen.size, total: expectedTotal });
       if (!result.nextPage || page >= result.lastPage) {
-        return { items: [...seen.values()], expectedTotal, complete: true };
+        const complete = expectedTotal === null || seen.size >= expectedTotal;
+        return {
+          items: [...seen.values()],
+          expectedTotal,
+          complete,
+          reason: complete ? null : 'followed_count_mismatch',
+        };
       }
       page = result.nextPage;
     }
@@ -164,10 +170,13 @@ export class TreeholeApi {
       }
       onPage({ page, count: seen.size + unkeyed.length, total: expectedTotal });
       if (!result.nextPage || page >= result.lastPage) {
+        const count = seen.size + unkeyed.length;
+        const complete = expectedTotal === null || count >= expectedTotal;
         return {
           items: [...seen.values(), ...unkeyed],
           expectedTotal,
-          complete: true,
+          complete,
+          reason: complete ? null : 'comment_count_mismatch',
         };
       }
       page = result.nextPage;

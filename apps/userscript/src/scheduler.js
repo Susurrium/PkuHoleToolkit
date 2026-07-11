@@ -7,15 +7,15 @@ function defaultSleep(milliseconds, signal) {
       reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
       return;
     }
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 

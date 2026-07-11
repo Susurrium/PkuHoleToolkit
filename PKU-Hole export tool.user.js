@@ -184,15 +184,15 @@ function defaultSleep(milliseconds, signal) {
       reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
       return;
     }
-    const timer = setTimeout(resolve, milliseconds);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -509,7 +509,13 @@ class TreeholeApi {
       }
       onPage({ page, count: seen.size, total: expectedTotal });
       if (!result.nextPage || page >= result.lastPage) {
-        return { items: [...seen.values()], expectedTotal, complete: true };
+        const complete = expectedTotal === null || seen.size >= expectedTotal;
+        return {
+          items: [...seen.values()],
+          expectedTotal,
+          complete,
+          reason: complete ? null : 'followed_count_mismatch',
+        };
       }
       page = result.nextPage;
     }
@@ -537,10 +543,13 @@ class TreeholeApi {
       }
       onPage({ page, count: seen.size + unkeyed.length, total: expectedTotal });
       if (!result.nextPage || page >= result.lastPage) {
+        const count = seen.size + unkeyed.length;
+        const complete = expectedTotal === null || count >= expectedTotal;
         return {
           items: [...seen.values(), ...unkeyed],
           expectedTotal,
-          complete: true,
+          complete,
+          reason: complete ? null : 'comment_count_mismatch',
         };
       }
       page = result.nextPage;
@@ -849,14 +858,31 @@ function legacyArchiveToItems(value) {
 }
 
 function validateArchiveV2(manifest, data) {
-  if (!manifest || manifest.schemaVersion !== 2) {
-    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 schemaVersion 不是 2');
+  if (
+    !manifest ||
+    manifest.schemaVersion !== 2 ||
+    typeof manifest.toolVersion !== 'string' ||
+    typeof manifest.runId !== 'string' ||
+    typeof manifest.exportedAt !== 'string' ||
+    typeof manifest.complete !== 'boolean' ||
+    !manifest.counts ||
+    !Array.isArray(manifest.errors)
+  ) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 manifest 不符合 v2 协议');
   }
   if (!data || !Array.isArray(data.items)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档缺少 data.items');
   }
+  const sources = new Set(['followed', 'referenced', 'explicit', 'legacy-v1']);
   for (const item of data.items) {
-    if (!item || !PID_PATTERN.test(String(item.pid)) || !item.hole || !Array.isArray(item.comments)) {
+    if (
+      !item ||
+      !PID_PATTERN.test(String(item.pid)) ||
+      !sources.has(item.source) ||
+      !['ok', 'partial'].includes(item.fetchStatus) ||
+      !item.hole ||
+      !Array.isArray(item.comments)
+    ) {
       throw new AppError(ERROR_CODES.INVALID_INPUT, '归档中存在无效的洞记录');
     }
   }
@@ -1213,6 +1239,7 @@ class ExportJob {
     this.confirmReferences = confirmReferences;
     this.pauseRequested = false;
     this.controller = null;
+    this.jobId = null;
   }
 
   requestPause() {
@@ -1267,7 +1294,10 @@ class ExportJob {
         : [
             {
               code: ERROR_CODES.INVALID_RESPONSE,
-              message: '关注列表达到安全页数上限',
+              message:
+                result.reason === 'followed_count_mismatch'
+                  ? '关注列表实际数量与服务端总数不一致'
+                  : '关注列表达到安全页数上限',
               phase: 'followed',
               retryable: true,
             },
@@ -1291,7 +1321,10 @@ class ExportJob {
           fetchStatus = 'partial';
           error = {
             code: ERROR_CODES.INVALID_RESPONSE,
-            message: `#${pid} 评论达到安全页数上限`,
+            message:
+              result.reason === 'comment_count_mismatch'
+                ? `#${pid} 评论实际数量与服务端总数不一致`
+                : `#${pid} 评论达到安全页数上限`,
             pid,
             phase: 'comments',
             retryable: true,
@@ -1361,6 +1394,7 @@ class ExportJob {
       job.options = options;
       job.errors = [];
     }
+    this.jobId = job.id;
 
     try {
       await this.saveState(job, JOB_STATES.PLANNING);
@@ -1521,6 +1555,7 @@ class ImportJob {
     this.onProgress = onProgress;
     this.controller = null;
     this.pauseRequested = false;
+    this.jobId = null;
   }
 
   requestPause() {
@@ -1606,6 +1641,7 @@ class ImportJob {
         results: [],
       };
     }
+    this.jobId = job.id;
     await this.store.putJob({ ...job, state: JOB_STATES.RUNNING });
     const previous = await this.store.getItems(job.id);
     const completedPids = new Set(previous.map((result) => result.pid));
@@ -2012,6 +2048,7 @@ function mountToolkit({
         !result.manifest.complete,
       );
     } catch (error) {
+      activeJobId = activeJobId || activeJob?.jobId || null;
       setMessage(error.message || '导出失败', true);
       statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
     } finally {
@@ -2088,6 +2125,7 @@ function mountToolkit({
         !result.paused && (result.audit.failed > 0 || result.audit.unknown > 0),
       );
     } catch (error) {
+      activeJobId = activeJobId || activeJob?.jobId || null;
       setMessage(error.message || '导入失败', true);
       statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
     } finally {

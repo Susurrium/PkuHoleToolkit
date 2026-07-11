@@ -112,3 +112,32 @@ test('import preview deduplicates legacy files and execute records an audit', as
   assert.equal(result.audit.followed, 1);
   assert.equal(result.audit.failed, 0);
 });
+
+test('a 2000-hole export completes without comment requests when reply count is zero', async () => {
+  const holes = Array.from({ length: 2000 }, (_, index) => ({
+    pid: 10000 + index,
+    text: `hole ${index}`,
+    reply: 0,
+    timestamp: index + 1,
+  }));
+  let commentCalls = 0;
+  const api = {
+    scheduler: { resetRateLimitCount() {} },
+    async getAllFollowed() {
+      return { complete: true, items: holes };
+    },
+    async getAllComments() {
+      commentCalls += 1;
+      return { complete: true, items: [] };
+    },
+  };
+  const job = new ExportJob({
+    api,
+    store: new MemoryJobStore(),
+    accountFingerprint: 'fingerprint',
+  });
+  const result = await job.run({ scope: { type: 'all' }, referenceMode: 'none' });
+  assert.equal(result.manifest.counts.exportedHoles, 2000);
+  assert.equal(result.manifest.complete, true);
+  assert.equal(commentCalls, 0);
+});

@@ -17,6 +17,7 @@ export class ImportJob {
     this.onProgress = onProgress;
     this.controller = null;
     this.pauseRequested = false;
+    this.jobId = null;
   }
 
   requestPause() {
@@ -102,6 +103,7 @@ export class ImportJob {
         results: [],
       };
     }
+    this.jobId = job.id;
     await this.store.putJob({ ...job, state: JOB_STATES.RUNNING });
     const previous = await this.store.getItems(job.id);
     const completedPids = new Set(previous.map((result) => result.pid));
