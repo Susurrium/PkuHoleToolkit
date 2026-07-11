@@ -1,0 +1,6 @@
+{
+  "name": "@pku-hole-toolkit/archive-schema",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module"
+}

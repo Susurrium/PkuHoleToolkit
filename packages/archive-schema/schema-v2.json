@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Susurrium/PkuHoleToolkit/archive-v2.schema.json",
+  "title": "PKU Treehole Archive v2",
+  "type": "object",
+  "required": ["manifest", "data"],
+  "properties": {
+    "manifest": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "toolVersion",
+        "runId",
+        "exportedAt",
+        "scope",
+        "complete",
+        "counts",
+        "errors"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 2 },
+        "toolVersion": { "type": "string" },
+        "runId": { "type": "string" },
+        "exportedAt": { "type": "string", "format": "date-time" },
+        "accountFingerprint": { "type": "string" },
+        "scope": { "type": "object" },
+        "complete": { "type": "boolean" },
+        "counts": { "type": "object" },
+        "dateRange": { "type": ["object", "null"] },
+        "errors": { "type": "array" }
+      },
+      "additionalProperties": true
+    },
+    "data": {
+      "type": "object",
+      "required": ["items"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pid", "source", "hole", "comments", "fetchStatus"],
+            "properties": {
+              "pid": { "type": "string", "pattern": "^\\d{5,7}$" },
+              "source": { "enum": ["followed", "referenced", "explicit", "legacy-v1"] },
+              "hole": { "type": "object" },
+              "comments": { "type": "array" },
+              "fetchStatus": { "enum": ["ok", "partial"] }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

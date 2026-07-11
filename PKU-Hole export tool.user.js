@@ -1,544 +1,2220 @@
 // ==UserScript==
 // @name         PKU-Hole export tool
-// @author       WindMan
-// @namespace    http://tampermonkey.net/
-// @version      1.2.1
-// @license      MIT License
-// @description  导入/导出树洞中的关注列表
+// @name:zh-CN   北大树洞归档与关注迁移工具
+// @author       WindMan, Susurrium
+// @namespace    https://github.com/Susurrium/PkuHoleToolkit
+// @version      1.3.0
+// @license      MIT
+// @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
 // @grant        none
 // @run-at       document-end
-// @downloadURL https://update.greasyfork.org/scripts/465805/PKU-Hole%20export%20tool.user.js
-// @updateURL https://update.greasyfork.org/scripts/465805/PKU-Hole%20export%20tool.meta.js
+// @homepageURL  https://github.com/Susurrium/PkuHoleToolkit
+// @supportURL   https://github.com/Susurrium/PkuHoleToolkit/issues
 // ==/UserScript==
 
+// GENERATED FILE. Edit apps/userscript/src instead of this bundle.
+
+(() => {
+  'use strict';
+
+// ---- config.js ----
+const APP_VERSION = '1.3.0';
+const API_ORIGIN = 'https://treehole.pku.edu.cn';
+const API_BASE = `${API_ORIGIN}/api`;
+const JOB_DB_NAME = 'pku-hole-tool';
+const JOB_DB_VERSION = 1;
+const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+const PID_PATTERN = /^\d{5,7}$/;
+const REFERENCE_PATTERN = /#(\d{5,7})\b/g;
+
+const REQUEST_POLICY = Object.freeze({
+  readIntervalMs: 600,
+  writeIntervalMs: 1000,
+  jitterMs: 300,
+  timeoutMs: 20_000,
+  maxReadAttempts: 3,
+  missingRetryAfterMs: 60_000,
+});
+
+const LIMITS = Object.freeze({
+  followedPages: 1024,
+  commentPages: 500,
+  maxReferencedPids: 2000,
+  confirmReferencedPids: 200,
+  maxImportPids: 20_000,
+  maxArchiveBytes: 200 * 1024 * 1024,
+  maxUncompressedBytes: 500 * 1024 * 1024,
+});
+
+const JOB_STATES = Object.freeze({
+  PLANNING: 'planning',
+  RUNNING: 'running',
+  PAUSED: 'paused',
+  COMPLETED: 'completed',
+  PARTIAL: 'partial',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+});
 
 
-/* some global functions */
+// ---- errors.js ----
+const ERROR_CODES = Object.freeze({
+  NOT_FOUND: 'not_found',
+  UNAUTHORIZED: 'unauthorized',
+  RATE_LIMITED: 'rate_limited',
+  NETWORK_ERROR: 'network_error',
+  INVALID_RESPONSE: 'invalid_response',
+  BUSINESS_ERROR: 'business_error',
+  UNKNOWN_RESULT: 'unknown_result',
+  CANCELLED: 'cancelled',
+  INVALID_INPUT: 'invalid_input',
+  STORAGE_ERROR: 'storage_error',
+});
 
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+class AppError extends Error {
+  constructor(code, message, options = {}) {
+    super(message, options.cause ? { cause: options.cause } : undefined);
+    this.name = 'AppError';
+    this.code = code;
+    this.status = options.status ?? null;
+    this.retryable = Boolean(options.retryable);
+    this.operation = options.operation ?? null;
+    this.details = options.details ?? null;
+  }
 }
 
-function _getCookieObj() {
-	var cookieObj = {};
-	var cookieStr = document.cookie;
-	var pairList = cookieStr.split(";");
-	for (var _i = 0, pairList_1 = pairList; _i < pairList_1.length; _i++) {
-		var pair = pairList_1[_i];
-		var _a = pair.trim().split("="),
-			key = _a[0],
-			value = _a[1];
-		cookieObj[key] = value;
-	}
-	return cookieObj;
+function isAppError(error, code = null) {
+  return error instanceof AppError && (code === null || error.code === code);
 }
 
-async function readFileAsync(file) {
-	return new Promise((resolve, reject) => {
-		const reader = new FileReader();
-
-		// 成功读取文件
-		reader.onload = function (event) {
-			resolve(event.target.result);
-		};
-
-		// 读取文件失败
-		reader.onerror = function (error) {
-			reject(error);
-		};
-
-		// 读取文件内容为文本
-		reader.readAsText(file);
-	});
+function toErrorRecord(error, fallback = {}) {
+  const normalized =
+    error instanceof AppError
+      ? error
+      : new AppError(ERROR_CODES.NETWORK_ERROR, error?.message || '未知错误', {
+          cause: error,
+          retryable: true,
+        });
+  return {
+    code: normalized.code,
+    message: normalized.message,
+    operation: normalized.operation,
+    status: normalized.status,
+    retryable: normalized.retryable,
+    ...fallback,
+  };
 }
 
-function _authHeaders(extra) {
-	return Object.assign({
-		accept: "application/json, text/plain, */*",
-		"accept-language": "zh-CN,zh;q=0.9",
-		authorization: `Bearer ${_getCookieObj()["pku_token"]}`,
-		"sec-fetch-dest": "empty",
-		"sec-fetch-mode": "cors",
-		"sec-fetch-site": "same-origin",
-		uuid: localStorage.getItem("pku-uuid"),
-	}, extra || {});
-}
-
-// fetch with timeout + retry/backoff. Returns parsed JSON or throws after maxAttempts.
-async function fetchJsonWithRetry(url, options, opts) {
-	const maxAttempts = (opts && opts.maxAttempts) || 4;
-	const timeoutMs = (opts && opts.timeoutMs) || 15000;
-	let lastError = null;
-	for (let attempt = 1; attempt <= maxAttempts; ++attempt) {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeoutMs);
-		try {
-			const response = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
-			clearTimeout(timer);
-			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}`);
-			}
-			return await response.json();
-		} catch (error) {
-			clearTimeout(timer);
-			lastError = error;
-			console.log(`fetch ${url} attempt ${attempt}/${maxAttempts} failed:`, error);
-			if (attempt < maxAttempts) {
-				await sleep(500 * Math.pow(2, attempt - 1));
-			}
-		}
-	}
-	throw lastError;
-}
-
-
-async function followedHoles() {
-	const fetchList = [];
-	let pages = 1024;
-	for (let page = 1; page <= pages; ++page) {
-		const data_ = await fetchJsonWithRetry(
-			`https://treehole.pku.edu.cn/api/follow_v2?page=${page}&limit=25`,
-			{
-				headers: _authHeaders(),
-				referrer: "https://treehole.pku.edu.cn/web/",
-				referrerPolicy: "strict-origin-when-cross-origin",
-				body: null,
-				method: "GET",
-				mode: "cors",
-				credentials: "include",
-			}
-		);
-
-		let data = data_.data.data;
-		fetchList.push(data);
-
-		if (data_.data.next_page_url == null) {
-			break;
-		}
-		await sleep(50);
-	}
-	return fetchList;
-}
-
-async function comments(holeid) {
-	const fetchList = [];
-	let pages = 240;
-	for (let page = 1; page <= pages; ++page) {
-		const data_ = await fetchJsonWithRetry(
-			`https://treehole.pku.edu.cn/api/pku_comment_v3/${holeid}?page=${page}&limit=15&sort=asc`,
-			{
-				headers: _authHeaders(),
-				referrer: "https://treehole.pku.edu.cn/web/",
-				referrerPolicy: "strict-origin-when-cross-origin",
-				body: null,
-				method: "GET",
-				mode: "cors",
-				credentials: "include",
-			}
-		);
-
-		let data = data_.data.data;
-		fetchList.push(data);
-
-		if (data_.data.next_page_url == null) {
-			break;
-		}
-		await sleep(20);
-	}
-	return fetchList;
-}
-
-async function getHole(holeid) {
-	let data;
-	try {
-		data = await fetchJsonWithRetry(
-			`https://treehole.pku.edu.cn/api/pku/${holeid}/`,
-			{
-				headers: _authHeaders(),
-				referrer: "https://treehole.pku.edu.cn/web/",
-				referrerPolicy: "strict-origin-when-cross-origin",
-				body: null,
-				method: "GET",
-				mode: "cors",
-				credentials: "include",
-			}
-		);
-	} catch (error) {
-		console.log(`getHole(${holeid}) gave up after retries:`, error);
-		return null;
-	}
-	if (data.code != 20000) {
-		return null;
-	}
-	return data.data;
+function throwIfAborted(signal, operation = null) {
+  if (signal?.aborted) {
+    throw new AppError(ERROR_CODES.CANCELLED, '操作已取消', { operation });
+  }
 }
 
 
-
-function downloadFile(text, filename) {
-	const blob = new Blob([text], { type: "text/plain" });
-
-	const downloadLink = document.createElement("a");
-	downloadLink.download = filename;
-	downloadLink.href = URL.createObjectURL(blob);
-	downloadLink.textContent = "Download";
-
-	document.body.appendChild(downloadLink);
-	downloadLink.click();
-	URL.revokeObjectURL(downloadLink.href);
+// ---- credentials.js ----
+function parseCookieString(cookieString = '') {
+  const result = {};
+  for (const rawPair of cookieString.split(';')) {
+    const pair = rawPair.trim();
+    if (!pair) continue;
+    const separator = pair.indexOf('=');
+    const rawKey = separator === -1 ? pair : pair.slice(0, separator);
+    const rawValue = separator === -1 ? '' : pair.slice(separator + 1);
+    try {
+      result[decodeURIComponent(rawKey)] = decodeURIComponent(rawValue);
+    } catch {
+      result[rawKey] = rawValue;
+    }
+  }
+  return result;
 }
 
-function comment2text(comments_) {
-	if (comments_[0] != undefined) { // 排除没有评论的情况
-		let buffer_ = "";
-		for (let i = 0; i < comments_.length; i++) {
-			let comment_list_ = comments_[i];
-			for (let j = 0; j < comment_list_.length; j++) {
-				let comment_ = comment_list_[j];
-				buffer_ += `${comment_.name}: ${comment_.text}\n`;
-			}
-		}
-		return buffer_;
-	}
-	return "";
+async function sha256Hex(value, cryptoObject) {
+  if (!cryptoObject?.subtle) {
+    throw new AppError(ERROR_CODES.INVALID_RESPONSE, '当前浏览器不支持安全账号指纹');
+  }
+  const bytes = new TextEncoder().encode(value);
+  const digest = await cryptoObject.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+    '',
+  );
 }
 
-function extractPidFromText(text) {
-	// extract pids from text
-	if (text == null) {
-		return [];
-	}
-	let regex = /\b\d{5,7}\b/g;
-	let matches = text.match(regex);
-	return matches == null ? [] : matches;
+async function getCredentials({
+  documentObject = globalThis.document,
+  storage = globalThis.localStorage,
+  cryptoObject = globalThis.crypto,
+} = {}) {
+  const cookies = parseCookieString(documentObject?.cookie || '');
+  const token = cookies.pku_token;
+  const uuid = storage?.getItem('pku-uuid');
+  if (!token || !uuid) {
+    throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录凭证缺失，请重新登录北大树洞', {
+      retryable: false,
+      operation: 'credentials',
+    });
+  }
+  return {
+    token,
+    uuid,
+    accountFingerprint: await sha256Hex(uuid, cryptoObject),
+  };
 }
 
-function processExtract(hole, comments_str, mode) {
-	let pids = [];
-	// mode > 1 (extract from text)
-	if (mode > 1) {
-		extractPidFromText(hole.text).forEach(pid => pids.push(pid));
-	}
-	// mode > 2 (extract from comments)
-	if (mode > 2) {
-		extractPidFromText(comments_str).forEach(pid => pids.push(pid));
-	}
-	return pids;
-}
-
-async function exportCitedHoles(buttonElement, holeids, file_num) {
-	let buffer = "";
-	let jsonbuffer = {
-		"holes": [],
-		"comments": []
-	};
-	let holenum = 0;
-	for (let i = 0; i < holeids.length; i++) {
-		let holeid = holeids[i];
-		let hole = await getHole(holeid);
-
-		if (hole && hole.pid) {
-			console.log(`export cited hole ${hole.pid}`);
-			buffer += `Id:${hole.pid}  Likenum:${hole.likenum}  Reply:${hole.reply
-				}  Time:${new Date(hole.timestamp * 1000).toLocaleString()}\n`;
-			let comments_ = await comments(hole.pid);
-			jsonbuffer.holes.push(hole);
-			jsonbuffer.comments.push(comments_);
-			holenum += 1;
-			buttonElement.textContent = holenum.toString();
-			buffer += `洞主: ${hole.text}\n`;
-			buffer += comment2text(comments_);
-			buffer += "\n======================\n\n";
-			await sleep(10);
-		}
-
-		if ((i + 1) % 100 == 0 || i == holeids.length - 1) {
-			downloadFile(buffer, "export-cited-part-" + (file_num + 1).toString() + ".txt");
-			downloadFile(JSON.stringify(jsonbuffer), "export-cited-part-" + (file_num + 1).toString() + ".json");
-			file_num += 1;
-			buffer = "";
-			jsonbuffer = {
-				"holes": [],
-				"comments": []
-			};
-		}
-	}
-}
-
-async function exportFollowedHoles(buttonElement, mode) {
-	// mode:
-	// 1: just export followed holes
-	// 2: export followed holes and holes in the text
-	// 3: export followed holes and holes in the text and comments
-	let buffer = "";
-	let jsonbuffer = {
-		"holes": [],
-		"comments": []
-	};
-	let holenum = 0;
-	let file_num = 0;
-	let extracted_pids = new Array();
-	let followsholes = await followedHoles();
-	// unroll
-	let holes = [];
-	for (let i = 0; i < followsholes.length; i++) {
-		let holelist = followsholes[i];
-		for (let j = 0; j < holelist.length; j++) {
-			holes.push(holelist[j]);
-		}
-	}
-
-
-	for (let i = 0; i < holes.length; i++) {
-		let hole = holes[i];
-		console.log(`export followed hole ${hole.pid}`);
-		buffer += `Id:${hole.pid}  Likenum:${hole.likenum}  Reply:${hole.reply
-			}  Time:${new Date(hole.timestamp * 1000).toLocaleString()}\n`;
-		let comments_ = await comments(hole.pid);
-		jsonbuffer.holes.push(hole);
-		jsonbuffer.comments.push(comments_);
-		holenum += 1;
-		buttonElement.textContent = holenum.toString();
-		const comments_text = comment2text(comments_);
-		buffer += `洞主: ${hole.text}\n`;
-		buffer += comments_text;
-		buffer += "\n======================\n\n";
-
-		let extracted_pids_ = processExtract(hole, comments_text, mode);
-		extracted_pids_.forEach(pid => extracted_pids.push(pid));
-
-		await sleep(10);
-		if ((i + 1) % 100 == 0 || i == holes.length - 1) {
-			downloadFile(buffer, "export-part-" + (file_num + 1).toString() + ".txt");
-			downloadFile(JSON.stringify(jsonbuffer), "export-part-" + (file_num + 1).toString() + ".json");
-			file_num += 1;
-			buffer = "";
-			jsonbuffer = {
-				"holes": [],
-				"comments": []
-			};
-		}
-	}
-	// download cited holes (deduplicated; exclude pids already in followed list)
-	const followed_pid_set = new Set(holes.map(h => String(h.pid)));
-	const unique_cited_pids = Array.from(new Set(extracted_pids.map(String)))
-		.filter(pid => !followed_pid_set.has(pid));
-	if (unique_cited_pids.length > 0) {
-		alert(`关注列表导出完成，现在导出被引用树洞（去重后 ${unique_cited_pids.length} 个）`);
-		console.log("extracted pids (unique):");
-		console.log(unique_cited_pids);
-		await exportCitedHoles(buttonElement, unique_cited_pids, file_num);
-	}
-}
-
-async function exportHoles(buttonElement) {
-	console.log("export.");
-	// get settings from user
-	const confirm_ = confirm(
-		"是否确定要导出关注列表？\n" +
-		"每导出100条树洞生成一个文件\n" + 
-		"导出时会实时显示导出树洞的数目" + 
-		"\n若想要停止导出,直接刷新浏览器界面即可"
-	);
-	if (!confirm_) {
-		alert("已取消导出");
-		return;
-	}
-
-	let mode = prompt("请选择导出模式：\n" +
-		"1. 【仅导出】您关注的树洞（默认）\n" +
-		"2. 导出您关注的树洞以及在树洞【正文中】被引的洞\n" +
-		"3. 导出您关注的树洞以及在树洞【正文和评论中】被引的洞\n" +
-		"请输入1-3中的一个数字以选定模式"
-		, "1");
-
-	// bad result
-	if (mode === "0") {
-		alert("已取消导出");
-		return;
-	}
-	if (!['1', '2', '3'].includes(mode)) {
-		alert("输入错误，若想重试请重新点击导出按钮并输入正确的数字");
-		return;
-	}
-
-	if (confirm_) {
-		buttonElement.textContent = "稍候";
-		await exportFollowedHoles(buttonElement, parseInt(mode));
-		buttonElement.textContent = "导出";
-	}
-
-}
-
-async function initInputElement(fileInput) {
-	fileInput.multiple = true;
-	fileInput.type = "file";
-	fileInput.accept = ".json";
-	fileInput.id = "file-input";
-	fileInput.style.display = "none";
-	document.body.appendChild(fileInput);
+function createAuthHeaders(credentials, extra = {}) {
+  if (!credentials?.token || !credentials?.uuid) {
+    throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录凭证无效');
+  }
+  return {
+    accept: 'application/json, text/plain, */*',
+    authorization: `Bearer ${credentials.token}`,
+    uuid: credentials.uuid,
+    ...extra,
+  };
 }
 
 
-/*
-follow a hole
-return:
-	"not exist" - hole not exist
-	"already followed" - hole already followed
-	"success" - follow success
-*/
-async function followHole(holeid) {
-	// check if hole not exist or already followed
-	// return "not exist" or "already followed" or "success" or "fail"
-	const targetHole = await getHole(holeid);
-	if (targetHole == null) {
-		console.log(`Hole ${holeid} does not exist.`);
-		return "not exist";
-	}
-	if (targetHole.is_follow) {
-		console.log(`Hole ${holeid} is already followed.`);
-		return "already followed";
-	}
-	try {
-		const data = await fetchJsonWithRetry(`https://treehole.pku.edu.cn/api/pku_attention/${holeid}`, {
-			headers: _authHeaders({
-				'Cache-Control': 'no-cache',
-				'Origin': 'https://treehole.pku.edu.cn',
-				'Pragma': 'no-cache',
-			}),
-			method: 'POST',
-			referrer: "https://treehole.pku.edu.cn/web/",
-			mode: "cors",
-			credentials: "include",
-		});
-		if (data.code !== 20000) {
-			console.log(`Hole ${holeid} follow request returned code ${data.code}: ${data.msg}`);
-			return "fail";
-		}
-	} catch (error) {
-		console.log(`Hole ${holeid} follow request gave up:`, error);
-		return "fail";
-	}
-	return "success";
+// ---- scheduler.js ----
+function defaultSleep(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+      return;
+    }
+    const timer = setTimeout(resolve, milliseconds);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+      },
+      { once: true },
+    );
+  });
+}
+
+function retryAfterMilliseconds(value, now) {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now()) : null;
+}
+
+function isRetryableStatus(status) {
+  return [408, 429, 500, 502, 503, 504].includes(status);
+}
+
+class RequestScheduler {
+  constructor({
+    fetchImpl = globalThis.fetch?.bind(globalThis),
+    sleepImpl = defaultSleep,
+    now = Date.now,
+    random = Math.random,
+    policy = REQUEST_POLICY,
+    onRateLimit = () => {},
+  } = {}) {
+    if (!fetchImpl) throw new TypeError('fetchImpl is required');
+    this.fetchImpl = fetchImpl;
+    this.sleepImpl = sleepImpl;
+    this.now = now;
+    this.random = random;
+    this.policy = { ...REQUEST_POLICY, ...policy };
+    this.onRateLimit = onRateLimit;
+    this.queue = Promise.resolve();
+    this.lastStartedAt = 0;
+    this.rateLimitCount = 0;
+  }
+
+  resetRateLimitCount() {
+    this.rateLimitCount = 0;
+  }
+
+  async enqueue(kind, signal, callback) {
+    const previous = this.queue;
+    let release;
+    this.queue = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      throwIfAborted(signal);
+      const interval =
+        kind === 'write' ? this.policy.writeIntervalMs : this.policy.readIntervalMs;
+      const jitter = Math.floor(this.random() * (this.policy.jitterMs + 1));
+      const remaining = this.lastStartedAt + interval + jitter - this.now();
+      if (remaining > 0) await this.sleepImpl(remaining, signal);
+      this.lastStartedAt = this.now();
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+
+  async fetchAttempt(url, options, context) {
+    return this.enqueue(context.kind, context.signal, async () => {
+      const controller = new AbortController();
+      let externallyAborted = false;
+      const onAbort = () => {
+        externallyAborted = true;
+        controller.abort(context.signal?.reason);
+      };
+      context.signal?.addEventListener('abort', onAbort, { once: true });
+      const timer = setTimeout(() => controller.abort('timeout'), this.policy.timeoutMs);
+      try {
+        const response = await this.fetchImpl(url, { ...options, signal: controller.signal });
+        let body;
+        try {
+          body = await response.json();
+        } catch (error) {
+          if (!response.ok) body = null;
+          else {
+            throw new AppError(ERROR_CODES.INVALID_RESPONSE, '服务器返回了无法解析的数据', {
+              cause: error,
+              status: response.status,
+              retryable: context.kind === 'read',
+              operation: context.operation,
+            });
+          }
+        }
+        return { response, body };
+      } catch (error) {
+        if (externallyAborted || context.signal?.aborted) {
+          throw new AppError(ERROR_CODES.CANCELLED, '操作已取消', {
+            cause: error,
+            operation: context.operation,
+          });
+        }
+        if (error instanceof AppError) throw error;
+        throw new AppError(ERROR_CODES.NETWORK_ERROR, '网络请求失败或超时', {
+          cause: error,
+          retryable: context.kind === 'read',
+          operation: context.operation,
+        });
+      } finally {
+        clearTimeout(timer);
+        context.signal?.removeEventListener('abort', onAbort);
+      }
+    });
+  }
+
+  async requestJson(url, options = {}, context = {}) {
+    const normalized = {
+      operation: context.operation || 'request',
+      kind: context.kind === 'write' ? 'write' : 'read',
+      signal: context.signal,
+    };
+    const maxAttempts =
+      normalized.kind === 'write' ? 1 : Math.max(1, this.policy.maxReadAttempts);
+    let lastError;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      throwIfAborted(normalized.signal, normalized.operation);
+      try {
+        const { response, body } = await this.fetchAttempt(url, options, normalized);
+        const status = response.status;
+        if (response.ok) return body;
+
+        if (status === 401 || status === 403) {
+          throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录已过期或没有访问权限', {
+            status,
+            operation: normalized.operation,
+          });
+        }
+        if (status === 404) {
+          throw new AppError(ERROR_CODES.NOT_FOUND, '目标不存在', {
+            status,
+            operation: normalized.operation,
+          });
+        }
+        if (status === 429) {
+          this.rateLimitCount += 1;
+          const retryAfter =
+            retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now) ??
+            this.policy.missingRetryAfterMs;
+          this.onRateLimit({ retryAfter, count: this.rateLimitCount });
+          if (this.rateLimitCount >= 2 || normalized.kind === 'write') {
+            throw new AppError(ERROR_CODES.RATE_LIMITED, '请求过于频繁，任务已暂停', {
+              status,
+              retryable: true,
+              operation: normalized.operation,
+              details: { retryAfter },
+            });
+          }
+          if (attempt < maxAttempts) {
+            await this.sleepImpl(retryAfter, normalized.signal);
+            continue;
+          }
+        }
+
+        throw new AppError(ERROR_CODES.BUSINESS_ERROR, `HTTP ${status}`, {
+          status,
+          retryable: normalized.kind === 'read' && isRetryableStatus(status),
+          operation: normalized.operation,
+          details: body,
+        });
+      } catch (error) {
+        lastError = error;
+        const canRetry =
+          normalized.kind === 'read' &&
+          error instanceof AppError &&
+          error.retryable &&
+          error.code !== ERROR_CODES.RATE_LIMITED &&
+          attempt < maxAttempts;
+        if (!canRetry) throw error;
+        const delay = 1000 * 2 ** (attempt - 1) + Math.floor(this.random() * 300);
+        await this.sleepImpl(delay, normalized.signal);
+      }
+    }
+    throw lastError;
+  }
 }
 
 
+// ---- api.js ----
+function normalizePid(value) {
+  const pid = String(value ?? '').trim();
+  if (!PID_PATTERN.test(pid)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `非法 PID：${pid || '(空)'}`);
+  }
+  return pid;
+}
 
-async function parseInputFile(file) {
-	try {
-		const content = await readFileAsync(file);
-		if (file.name.endsWith(".json")) {
-			const fileData = JSON.parse(content);
-			var pidList = new Array();
-			for (const hole of fileData.holes) {
-				if (hole && hole.pid) {
-					pidList.push(hole.pid);
-				}
-			}
-			return pidList;
-		} else {
-			return [];
-		}
-	} catch (error) {
-		console.log(`Error reading or parsing file ${file.name}:`, error);
-		return [];
-	}
+function apiUrl(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.href;
+}
+
+function unwrapPayload(payload, operation) {
+  if (!payload || typeof payload !== 'object') {
+    throw new AppError(ERROR_CODES.INVALID_RESPONSE, 'API 响应不是对象', { operation });
+  }
+  if (payload.success === false || (payload.code !== undefined && payload.code !== 20000)) {
+    const message = payload.message || payload.msg || 'API 请求失败';
+    const code = /不存在|not\s*found/i.test(message)
+      ? ERROR_CODES.NOT_FOUND
+      : ERROR_CODES.BUSINESS_ERROR;
+    throw new AppError(code, message, {
+      operation,
+      details: payload,
+    });
+  }
+  return payload.data ?? payload;
+}
+
+function normalizePaginator(value, operation, fallbackPage = 1) {
+  if (Array.isArray(value)) {
+    return { items: value, nextPage: null, lastPage: 1, total: value.length };
+  }
+  if (!value || typeof value !== 'object' || !Array.isArray(value.data)) {
+    throw new AppError(ERROR_CODES.INVALID_RESPONSE, 'API 分页结构发生变化', {
+      operation,
+      details: value,
+    });
+  }
+  const currentPage = Number(value.current_page || fallbackPage);
+  const parsedLastPage = Number(value.last_page);
+  const lastPage = Number.isFinite(parsedLastPage)
+    ? parsedLastPage
+    : value.next_page_url
+      ? Number.POSITIVE_INFINITY
+      : currentPage;
+  return {
+    items: value.data,
+    nextPage: value.next_page_url ? currentPage + 1 : null,
+    lastPage,
+    total: Number.isFinite(Number(value.total)) ? Number(value.total) : null,
+  };
+}
+
+class TreeholeApi {
+  constructor({ scheduler, credentialsProvider }) {
+    this.scheduler = scheduler;
+    this.credentialsProvider = credentialsProvider;
+  }
+
+  async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
+    const credentials = await this.credentialsProvider();
+    const body = await this.scheduler.requestJson(
+      apiUrl(path, params),
+      {
+        method,
+        credentials: 'include',
+        headers: createAuthHeaders(credentials),
+        referrer: 'https://treehole.pku.edu.cn/web/',
+        referrerPolicy: 'strict-origin-when-cross-origin',
+      },
+      { operation, kind, signal },
+    );
+    return unwrapPayload(body, operation);
+  }
+
+  async listBookmarks(signal) {
+    const value = await this.request('/bookmark', { signal, operation: 'list_bookmarks' });
+    if (!Array.isArray(value)) {
+      throw new AppError(ERROR_CODES.INVALID_RESPONSE, '收藏分组结构发生变化', {
+        operation: 'list_bookmarks',
+      });
+    }
+    return value.map((bookmark) => ({
+      id: String(bookmark.id),
+      name: String(bookmark.bookmark_name || bookmark.name || bookmark.id),
+    }));
+  }
+
+  async listFollowedPage({ page, limit = 25, bookmarkId, signal }) {
+    const value = await this.request('/follow_v2', {
+      params: { page, limit, bookmark_id: bookmarkId },
+      signal,
+      operation: 'list_followed',
+    });
+    return normalizePaginator(value, 'list_followed', page);
+  }
+
+  async listCommentsPage(pidValue, { page, limit = 15, signal }) {
+    const pid = normalizePid(pidValue);
+    const value = await this.request(`/pku_comment_v3/${encodeURIComponent(pid)}`, {
+      params: { page, limit, sort: 'asc' },
+      signal,
+      operation: 'list_comments',
+    });
+    return normalizePaginator(value, 'list_comments', page);
+  }
+
+  async getHole(pidValue, signal) {
+    const pid = normalizePid(pidValue);
+    return this.request(`/pku/${encodeURIComponent(pid)}/`, {
+      signal,
+      operation: 'get_hole',
+    });
+  }
+
+  async getAllFollowed({ bookmarkId = null, signal, onPage = () => {} } = {}) {
+    const seen = new Map();
+    let page = 1;
+    let expectedTotal = null;
+    while (page <= LIMITS.followedPages) {
+      const result = await this.listFollowedPage({ page, bookmarkId, signal });
+      expectedTotal = result.total ?? expectedTotal;
+      for (const hole of result.items) {
+        if (hole?.pid) seen.set(String(hole.pid), hole);
+      }
+      onPage({ page, count: seen.size, total: expectedTotal });
+      if (!result.nextPage || page >= result.lastPage) {
+        return { items: [...seen.values()], expectedTotal, complete: true };
+      }
+      page = result.nextPage;
+    }
+    return {
+      items: [...seen.values()],
+      expectedTotal,
+      complete: false,
+      reason: 'followed_page_limit',
+    };
+  }
+
+  async getAllComments(pidValue, { signal, onPage = () => {} } = {}) {
+    const pid = normalizePid(pidValue);
+    const seen = new Map();
+    const unkeyed = [];
+    let page = 1;
+    let expectedTotal = null;
+    while (page <= LIMITS.commentPages) {
+      const result = await this.listCommentsPage(pid, { page, signal });
+      expectedTotal = result.total ?? expectedTotal;
+      for (const comment of result.items) {
+        const key = comment?.cid ?? comment?.id;
+        if (key === undefined || key === null) unkeyed.push(comment);
+        else seen.set(String(key), comment);
+      }
+      onPage({ page, count: seen.size + unkeyed.length, total: expectedTotal });
+      if (!result.nextPage || page >= result.lastPage) {
+        return {
+          items: [...seen.values(), ...unkeyed],
+          expectedTotal,
+          complete: true,
+        };
+      }
+      page = result.nextPage;
+    }
+    return {
+      items: [...seen.values(), ...unkeyed],
+      expectedTotal,
+      complete: false,
+      reason: 'comment_page_limit',
+    };
+  }
+
+  async followHole(pidValue, signal) {
+    const pid = normalizePid(pidValue);
+    const before = await this.getHole(pid, signal);
+    if (before?.is_follow) return { status: 'already_followed', pid };
+
+    let postError = null;
+    try {
+      await this.request(`/pku_attention/${encodeURIComponent(pid)}`, {
+        method: 'POST',
+        kind: 'write',
+        signal,
+        operation: 'follow_hole',
+      });
+    } catch (error) {
+      postError = error;
+      if (
+        isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
+        isAppError(error, ERROR_CODES.CANCELLED) ||
+        isAppError(error, ERROR_CODES.RATE_LIMITED)
+      ) {
+        throw error;
+      }
+    }
+
+    try {
+      const after = await this.getHole(pid, signal);
+      if (after?.is_follow) {
+        return { status: postError ? 'followed_reconciled' : 'followed', pid };
+      }
+    } catch (reconcileError) {
+      throw new AppError(ERROR_CODES.UNKNOWN_RESULT, `无法确认 #${pid} 的最终关注状态`, {
+        cause: postError || reconcileError,
+        operation: 'follow_hole',
+        retryable: false,
+      });
+    }
+
+    throw new AppError(ERROR_CODES.UNKNOWN_RESULT, `#${pid} 未处于关注状态`, {
+      cause: postError,
+      operation: 'follow_hole',
+      retryable: false,
+    });
+  }
 }
 
 
-async function importHoles(buttonElement) {
-	// init file input
-	const fileInput = document.createElement("input");
-	await initInputElement(fileInput);
-	var total_holes = 0;
-	var success_holes = 0;
-	var skipped_holes = 0;
-	var notexist_holes = 0;
+// ---- zip.js ----
+const ZIP_SIGNATURES = Object.freeze({
+  LOCAL: 0x04034b50,
+  CENTRAL: 0x02014b50,
+  END: 0x06054b50,
+});
 
-	// trigger file input
-	const confirm_input = confirm("是否继续选择要导入的文件？可一次导入多个，可导入多次\n（目前仅支持之前通过此插件导出的json文件作为输入）");
-	if (confirm_input) {
-		fileInput.click();
-	}
+let crcTable = null;
 
-	fileInput.onchange = async (event) => {
-		const files = event.target.files;
-		if (files.length === 0) {
-			alert("未选择任何文件，已取消导入");
-			return;
-		}
-		console.log(`Selected ${files.length} file(s):`);
-		for (const file of files) {
-			var hole_list = await parseInputFile(file);
-			console.log(`parsed file ${file.name}, got ${hole_list.length} holes.`);
+function getCrcTable() {
+  if (crcTable) return crcTable;
+  crcTable = new Uint32Array(256);
+  for (let value = 0; value < 256; value += 1) {
+    let crc = value;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+    }
+    crcTable[value] = crc >>> 0;
+  }
+  return crcTable;
+}
 
-			for (const holeid of hole_list) {
-				var result = await followHole(holeid);
-				if (result === "success") {
-					success_holes += 1;
-					console.log(`Followed hole ${holeid} successfully.`);
-				} else if (result === "already followed") {
-					skipped_holes += 1;
-					console.log(`Hole ${holeid} is already followed, skipped.`);
-				} else if (result === "not exist") {
-					notexist_holes += 1;
-					console.log(`Hole ${holeid} does not exist, skipped.`);
-				}
-				total_holes += 1;
-				buttonElement.textContent = `${total_holes}`;
-				await sleep(50); // avoid too many requests
-			}
-		}
-		buttonElement.textContent = "结束";
-		// summary
-		alert(`导入完成！\n总共处理文件数量: ${files.length}\n总共处理树洞数量: ${total_holes}\n成功关注数量: ${success_holes}\n` + 
-					`跳过的数量（由于已经关注了）: ${skipped_holes}\n不存在的树洞数量: ${notexist_holes}`);
-		// reset button text
-		buttonElement.textContent = "导入/导出";
-	}
+function crc32(bytes) {
+  const table = getCrcTable();
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = table[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function uint16(value) {
+  return [value & 0xff, (value >>> 8) & 0xff];
+}
+
+function uint32(value) {
+  return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
+}
+
+function concatBytes(parts) {
+  const length = parts.reduce((total, part) => total + part.length, 0);
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+function asBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  return new TextEncoder().encode(String(value));
+}
+
+function safeArchiveName(name) {
+  const normalized = String(name).replaceAll('\\', '/');
+  if (
+    !normalized ||
+    normalized.startsWith('/') ||
+    normalized.includes('../') ||
+    normalized.includes('/..')
+  ) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `不安全的归档路径：${name}`);
+  }
+  return normalized;
+}
+
+function createZip(entries, date = new Date()) {
+  const localParts = [];
+  const centralParts = [];
+  let localOffset = 0;
+  const dos = dosDateTime(date);
+
+  for (const [rawName, rawData] of Object.entries(entries)) {
+    const name = safeArchiveName(rawName);
+    const nameBytes = new TextEncoder().encode(name);
+    const data = asBytes(rawData);
+    const checksum = crc32(data);
+    const localHeader = new Uint8Array([
+      ...uint32(ZIP_SIGNATURES.LOCAL),
+      ...uint16(20),
+      ...uint16(0x0800),
+      ...uint16(0),
+      ...uint16(dos.time),
+      ...uint16(dos.date),
+      ...uint32(checksum),
+      ...uint32(data.length),
+      ...uint32(data.length),
+      ...uint16(nameBytes.length),
+      ...uint16(0),
+    ]);
+    const localRecord = concatBytes([localHeader, nameBytes, data]);
+    localParts.push(localRecord);
+
+    const centralHeader = new Uint8Array([
+      ...uint32(ZIP_SIGNATURES.CENTRAL),
+      ...uint16(20),
+      ...uint16(20),
+      ...uint16(0x0800),
+      ...uint16(0),
+      ...uint16(dos.time),
+      ...uint16(dos.date),
+      ...uint32(checksum),
+      ...uint32(data.length),
+      ...uint32(data.length),
+      ...uint16(nameBytes.length),
+      ...uint16(0),
+      ...uint16(0),
+      ...uint16(0),
+      ...uint16(0),
+      ...uint32(0),
+      ...uint32(localOffset),
+    ]);
+    centralParts.push(concatBytes([centralHeader, nameBytes]));
+    localOffset += localRecord.length;
+  }
+
+  const centralDirectory = concatBytes(centralParts);
+  const end = new Uint8Array([
+    ...uint32(ZIP_SIGNATURES.END),
+    ...uint16(0),
+    ...uint16(0),
+    ...uint16(centralParts.length),
+    ...uint16(centralParts.length),
+    ...uint32(centralDirectory.length),
+    ...uint32(localOffset),
+    ...uint16(0),
+  ]);
+  return concatBytes([...localParts, centralDirectory, end]);
+}
+
+function findEndOffset(view) {
+  const minimum = Math.max(0, view.byteLength - 65_557);
+  for (let offset = view.byteLength - 22; offset >= minimum; offset -= 1) {
+    if (view.getUint32(offset, true) === ZIP_SIGNATURES.END) return offset;
+  }
+  return -1;
+}
+
+function readZip(input, { maxUncompressedBytes = Infinity } = {}) {
+  const bytes = asBytes(input);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const endOffset = findEndOffset(view);
+  if (endOffset === -1) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '不是有效的 ZIP 文件');
+  }
+  const entryCount = view.getUint16(endOffset + 10, true);
+  let centralOffset = view.getUint32(endOffset + 16, true);
+  let totalUncompressed = 0;
+  const entries = {};
+
+  for (let index = 0; index < entryCount; index += 1) {
+    if (view.getUint32(centralOffset, true) !== ZIP_SIGNATURES.CENTRAL) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, 'ZIP 中央目录损坏');
+    }
+    const compression = view.getUint16(centralOffset + 10, true);
+    const checksum = view.getUint32(centralOffset + 16, true);
+    const compressedSize = view.getUint32(centralOffset + 20, true);
+    const uncompressedSize = view.getUint32(centralOffset + 24, true);
+    const nameLength = view.getUint16(centralOffset + 28, true);
+    const extraLength = view.getUint16(centralOffset + 30, true);
+    const commentLength = view.getUint16(centralOffset + 32, true);
+    const localHeaderOffset = view.getUint32(centralOffset + 42, true);
+    const nameBytes = bytes.subarray(centralOffset + 46, centralOffset + 46 + nameLength);
+    const name = safeArchiveName(new TextDecoder().decode(nameBytes));
+    totalUncompressed += uncompressedSize;
+    if (totalUncompressed > maxUncompressedBytes) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, 'ZIP 解压后超过允许大小');
+    }
+    if (compression !== 0) {
+      throw new AppError(
+        ERROR_CODES.INVALID_INPUT,
+        `ZIP 条目 ${name} 使用了暂不支持的压缩方式`,
+      );
+    }
+    if (view.getUint32(localHeaderOffset, true) !== ZIP_SIGNATURES.LOCAL) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, 'ZIP 本地文件头损坏');
+    }
+    const localNameLength = view.getUint16(localHeaderOffset + 26, true);
+    const localExtraLength = view.getUint16(localHeaderOffset + 28, true);
+    const dataOffset = localHeaderOffset + 30 + localNameLength + localExtraLength;
+    const data = bytes.slice(dataOffset, dataOffset + compressedSize);
+    if (data.length !== uncompressedSize || crc32(data) !== checksum) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `ZIP 条目 ${name} 校验失败`);
+    }
+    entries[name] = data;
+    centralOffset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
 }
 
 
+// ---- archive.js ----
+const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid/i;
 
+function sanitizeForArchive(value, seen = new WeakSet()) {
+  if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
+  if (Array.isArray(value)) return value.map((item) => sanitizeForArchive(item, seen));
+  if (typeof value !== 'object') return undefined;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  const result = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (SENSITIVE_KEY_PATTERN.test(key)) continue;
+    const sanitized = sanitizeForArchive(nested, seen);
+    if (sanitized !== undefined) result[key] = sanitized;
+  }
+  seen.delete(value);
+  return result;
+}
 
-async function entrypoint(buttonElement) {
-	console.log("starting.");
-	// get settings from user
-	const mode_choice = prompt(
-		"选择功能模式：\n" +
-		"1. 导入\n" +
-		"2. 导出\n" + 
-		"请输入1-2中的一个数字以选定模式"
-	);
-	// bad result
-	if (!['1', '2'].includes(mode_choice)) {
-		return;
-	}
+function flattenLegacyComments(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  const visit = (item) => {
+    if (Array.isArray(item)) item.forEach(visit);
+    else if (item && typeof item === 'object') result.push(item);
+  };
+  value.forEach(visit);
+  return result;
+}
 
-	if (mode_choice === "1") {
-		await importHoles(buttonElement);
-	} else if (mode_choice === "2") {
-		await exportHoles(buttonElement);
-	}
+function legacyArchiveToItems(value) {
+  if (!value || !Array.isArray(value.holes)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '旧版 JSON 缺少 holes 数组');
+  }
+  const comments = Array.isArray(value.comments) ? value.comments : [];
+  return value.holes.map((hole, index) => {
+    if (!hole || !PID_PATTERN.test(String(hole.pid))) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `旧版 JSON 第 ${index + 1} 条洞记录 PID 无效`);
+    }
+    return {
+      pid: String(hole.pid),
+      source: 'legacy-v1',
+      hole: sanitizeForArchive(hole),
+      comments: sanitizeForArchive(flattenLegacyComments(comments[index])),
+      fetchStatus: 'ok',
+    };
+  });
+}
+
+function validateArchiveV2(manifest, data) {
+  if (!manifest || manifest.schemaVersion !== 2) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 schemaVersion 不是 2');
+  }
+  if (!data || !Array.isArray(data.items)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档缺少 data.items');
+  }
+  for (const item of data.items) {
+    if (!item || !PID_PATTERN.test(String(item.pid)) || !item.hole || !Array.isArray(item.comments)) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '归档中存在无效的洞记录');
+    }
+  }
+  return { manifest, data };
+}
+
+function buildReadableText(items) {
+  const lines = [];
+  for (const item of items) {
+    const hole = item.hole || {};
+    const timestamp = Number(hole.timestamp);
+    const formattedTime = Number.isFinite(timestamp)
+      ? new Date(timestamp * 1000).toLocaleString()
+      : '未知';
+    lines.push(
+      `Id:${item.pid}  Likenum:${hole.likenum ?? 0}  Reply:${hole.reply ?? 0}  Time:${formattedTime}`,
+      `洞主: ${hole.text ?? ''}`,
+    );
+    for (const comment of item.comments || []) {
+      lines.push(`${comment.name || '匿名'}: ${comment.text || ''}`);
+    }
+    lines.push('', '======================', '');
+  }
+  return lines.join('\n');
+}
+
+function createManifest({
+  runId,
+  accountFingerprint,
+  scope,
+  complete,
+  items,
+  errors = [],
+  expectedHoles = null,
+  exportedAt = new Date().toISOString(),
+}) {
+  const timestamps = items
+    .map((item) => Number(item.hole?.timestamp))
+    .filter((timestamp) => Number.isFinite(timestamp));
+  return {
+    schemaVersion: 2,
+    toolVersion: APP_VERSION,
+    runId,
+    exportedAt,
+    accountFingerprint,
+    scope: sanitizeForArchive(scope),
+    complete: Boolean(complete),
+    counts: {
+      expectedHoles,
+      exportedHoles: items.length,
+      comments: items.reduce((total, item) => total + item.comments.length, 0),
+      failed: errors.length,
+    },
+    dateRange: timestamps.length
+      ? {
+          earliest: new Date(Math.min(...timestamps) * 1000).toISOString(),
+          latest: new Date(Math.max(...timestamps) * 1000).toISOString(),
+        }
+      : null,
+    errors: sanitizeForArchive(errors),
+  };
+}
+
+function createArchive({ manifest, items, includeReadable = true }) {
+  const sanitizedItems = sanitizeForArchive(items);
+  const data = { items: sanitizedItems };
+  validateArchiveV2(manifest, data);
+  const entries = {
+    'manifest.json': `${JSON.stringify(manifest, null, 2)}\n`,
+    'data.json': `${JSON.stringify(data)}\n`,
+  };
+  if (includeReadable) entries['readable.txt'] = buildReadableText(sanitizedItems);
+  const bytes = createZip(entries, new Date(manifest.exportedAt));
+  return {
+    bytes,
+    blob: new Blob([bytes], { type: 'application/zip' }),
+    filename: `pku-treehole-${manifest.runId}.treehole.zip`,
+  };
+}
+
+function decodeJson(bytes, name) {
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (error) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `${name} 不是有效 JSON`, { cause: error });
+  }
+}
+
+function parseArchiveBytes(bytes, filename = 'archive.zip') {
+  if (bytes.byteLength > LIMITS.maxArchiveBytes) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档文件超过 200MB');
+  }
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!isZip) {
+    const legacy = decodeJson(bytes, filename);
+    const items = legacyArchiveToItems(legacy);
+    return {
+      format: 'legacy-v1',
+      manifest: {
+        schemaVersion: 1,
+        complete: true,
+        counts: { exportedHoles: items.length },
+        errors: [],
+      },
+      data: { items },
+    };
+  }
+  const entries = readZip(bytes, { maxUncompressedBytes: LIMITS.maxUncompressedBytes });
+  if (!entries['manifest.json'] || !entries['data.json']) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, 'ZIP 缺少 manifest.json 或 data.json');
+  }
+  const manifest = decodeJson(entries['manifest.json'], 'manifest.json');
+  const data = decodeJson(entries['data.json'], 'data.json');
+  validateArchiveV2(manifest, data);
+  return { format: 'v2', manifest, data };
+}
+
+async function parseArchiveFile(file) {
+  if (!file || typeof file.arrayBuffer !== 'function') {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '请选择归档文件');
+  }
+  if (file.size > LIMITS.maxArchiveBytes) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档文件超过 200MB');
+  }
+  return parseArchiveBytes(new Uint8Array(await file.arrayBuffer()), file.name);
 }
 
 
-(window.onload = function () {
-	"use strict";
-	let running = false;
-	const searchbtnElement = document.querySelector("div.search-btn");
-	const buttonElement = document.createElement("button");
-	buttonElement.textContent = "导入/导出";
-	buttonElement.style.minWidth = "75px";
-	buttonElement.addEventListener("click", async function () {
-		if (!running) {
-			running = true;
-			await entrypoint(this);
-			running = false;
-		}
-	});
-	if (searchbtnElement) {
-		searchbtnElement.insertAdjacentElement("beforebegin", buttonElement);
-	}
+// ---- storage.js ----
+function cloneValue(value) {
+  if (value === undefined) return undefined;
+  return globalThis.structuredClone
+    ? globalThis.structuredClone(value)
+    : JSON.parse(JSON.stringify(value));
+}
+
+function requestPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function transactionPromise(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error || new Error('transaction aborted'));
+  });
+}
+
+class JobStore {
+  constructor({ indexedDBObject = globalThis.indexedDB, now = Date.now } = {}) {
+    if (!indexedDBObject) throw new AppError(ERROR_CODES.STORAGE_ERROR, '浏览器不支持 IndexedDB');
+    this.indexedDBObject = indexedDBObject;
+    this.now = now;
+    this.databasePromise = null;
+  }
+
+  open() {
+    if (this.databasePromise) return this.databasePromise;
+    this.databasePromise = new Promise((resolve, reject) => {
+      const request = this.indexedDBObject.open(JOB_DB_NAME, JOB_DB_VERSION);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains('jobs')) {
+          database.createObjectStore('jobs', { keyPath: 'id' });
+        }
+        if (!database.objectStoreNames.contains('items')) {
+          const store = database.createObjectStore('items', { keyPath: 'key' });
+          store.createIndex('jobId', 'jobId', { unique: false });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    return this.databasePromise;
+  }
+
+  async putJob(job) {
+    try {
+      const database = await this.open();
+      const transaction = database.transaction('jobs', 'readwrite');
+      transaction.objectStore('jobs').put(cloneValue({ ...job, updatedAt: this.now() }));
+      await transactionPromise(transaction);
+      return job;
+    } catch (error) {
+      throw new AppError(ERROR_CODES.STORAGE_ERROR, '无法保存任务进度', { cause: error });
+    }
+  }
+
+  async getJob(id) {
+    const database = await this.open();
+    const transaction = database.transaction('jobs', 'readonly');
+    return requestPromise(transaction.objectStore('jobs').get(id));
+  }
+
+  async listJobs() {
+    const database = await this.open();
+    const transaction = database.transaction('jobs', 'readonly');
+    return requestPromise(transaction.objectStore('jobs').getAll());
+  }
+
+  async putItem(jobId, pid, item) {
+    const database = await this.open();
+    const transaction = database.transaction('items', 'readwrite');
+    transaction.objectStore('items').put({
+      key: `${jobId}:${pid}`,
+      jobId,
+      pid: String(pid),
+      item: cloneValue(item),
+    });
+    await transactionPromise(transaction);
+  }
+
+  async getItems(jobId) {
+    const database = await this.open();
+    const transaction = database.transaction('items', 'readonly');
+    const index = transaction.objectStore('items').index('jobId');
+    const records = await requestPromise(index.getAll(IDBKeyRange.only(jobId)));
+    return records.map((record) => record.item);
+  }
+
+  async deleteJob(jobId) {
+    const database = await this.open();
+    const transaction = database.transaction(['jobs', 'items'], 'readwrite');
+    transaction.objectStore('jobs').delete(jobId);
+    const index = transaction.objectStore('items').index('jobId');
+    const request = index.openKeyCursor(IDBKeyRange.only(jobId));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      transaction.objectStore('items').delete(cursor.primaryKey);
+      cursor.continue();
+    };
+    await transactionPromise(transaction);
+  }
+
+  async cleanup() {
+    const jobs = await this.listJobs();
+    const cutoff = this.now() - JOB_RETENTION_MS;
+    for (const job of jobs) {
+      if ((job.updatedAt || job.createdAt || 0) < cutoff) await this.deleteJob(job.id);
+    }
+  }
+}
+
+class MemoryJobStore {
+  constructor({ now = Date.now } = {}) {
+    this.now = now;
+    this.jobs = new Map();
+    this.items = new Map();
+  }
+
+  async putJob(job) {
+    this.jobs.set(job.id, cloneValue({ ...job, updatedAt: this.now() }));
+    return job;
+  }
+
+  async getJob(id) {
+    return cloneValue(this.jobs.get(id));
+  }
+
+  async listJobs() {
+    return [...this.jobs.values()].map(cloneValue);
+  }
+
+  async putItem(jobId, pid, item) {
+    this.items.set(`${jobId}:${pid}`, cloneValue(item));
+  }
+
+  async getItems(jobId) {
+    return [...this.items.entries()]
+      .filter(([key]) => key.startsWith(`${jobId}:`))
+      .map(([, item]) => cloneValue(item));
+  }
+
+  async deleteJob(jobId) {
+    this.jobs.delete(jobId);
+    for (const key of this.items.keys()) {
+      if (key.startsWith(`${jobId}:`)) this.items.delete(key);
+    }
+  }
+
+  async cleanup() {
+    const cutoff = this.now() - JOB_RETENTION_MS;
+    for (const job of await this.listJobs()) {
+      if ((job.updatedAt || job.createdAt || 0) < cutoff) await this.deleteJob(job.id);
+    }
+  }
+}
+
+
+// ---- export-job.js ----
+function createRunId(now = new Date()) {
+  const timestamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const suffix = globalThis.crypto?.randomUUID?.().slice(0, 8) || Math.random().toString(16).slice(2, 10);
+  return `${timestamp}-${suffix}`;
+}
+
+function referencesFromText(text) {
+  const pids = [];
+  if (!text) return pids;
+  for (const match of String(text).matchAll(REFERENCE_PATTERN)) pids.push(match[1]);
+  return pids;
+}
+
+function normalizedOptions(options = {}) {
+  const scope = options.scope || { type: 'all' };
+  if (!['all', 'group', 'pids', 'date'].includes(scope.type)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '未知导出范围');
+  }
+  return {
+    scope: {
+      type: scope.type,
+      bookmarkId: scope.bookmarkId ? String(scope.bookmarkId) : null,
+      pids: Array.isArray(scope.pids) ? [...new Set(scope.pids.map(normalizePid))] : [],
+      startDate: scope.startDate || null,
+      endDate: scope.endDate || null,
+    },
+    includeComments: options.includeComments !== false,
+    includeReadable: options.includeReadable !== false,
+    referenceMode: ['none', 'body', 'all'].includes(options.referenceMode)
+      ? options.referenceMode
+      : 'none',
+    confirmedLargeReferences: Boolean(options.confirmedLargeReferences),
+  };
+}
+
+function filterByDate(holes, scope) {
+  if (scope.type !== 'date') return holes;
+  const start = scope.startDate ? Date.parse(scope.startDate) / 1000 : -Infinity;
+  const end = scope.endDate ? (Date.parse(scope.endDate) + 86_399_999) / 1000 : Infinity;
+  return holes.filter((hole) => {
+    const timestamp = Number(hole.timestamp);
+    return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end;
+  });
+}
+
+class ExportJob {
+  constructor({
+    api,
+    store,
+    accountFingerprint,
+    now = () => new Date(),
+    onProgress = () => {},
+    confirmReferences = async (count) => count <= LIMITS.confirmReferencedPids,
+  }) {
+    this.api = api;
+    this.store = store;
+    this.accountFingerprint = accountFingerprint;
+    this.now = now;
+    this.onProgress = onProgress;
+    this.confirmReferences = confirmReferences;
+    this.pauseRequested = false;
+    this.controller = null;
+  }
+
+  requestPause() {
+    this.pauseRequested = true;
+  }
+
+  cancel() {
+    this.controller?.abort('cancelled');
+  }
+
+  emit(event) {
+    this.onProgress(event);
+  }
+
+  async saveState(job, state, patch = {}) {
+    Object.assign(job, patch, { state });
+    await this.store.putJob(job);
+    this.emit({ type: 'state', state, jobId: job.id, ...patch });
+  }
+
+  async planHoles(options, signal) {
+    if (options.scope.type === 'pids') {
+      const holes = [];
+      const errors = [];
+      for (const pid of options.scope.pids) {
+        throwIfAborted(signal, 'plan_explicit_pids');
+        try {
+          holes.push(await this.api.getHole(pid, signal));
+        } catch (error) {
+          if (
+            isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
+            isAppError(error, ERROR_CODES.RATE_LIMITED) ||
+            isAppError(error, ERROR_CODES.CANCELLED)
+          ) {
+            throw error;
+          }
+          errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
+        }
+      }
+      return { holes, complete: errors.length === 0, errors };
+    }
+    const result = await this.api.getAllFollowed({
+      bookmarkId: options.scope.type === 'group' ? options.scope.bookmarkId : null,
+      signal,
+      onPage: (progress) => this.emit({ type: 'planning', ...progress }),
+    });
+    return {
+      holes: filterByDate(result.items, options.scope),
+      complete: result.complete,
+      errors: result.complete
+        ? []
+        : [
+            {
+              code: ERROR_CODES.INVALID_RESPONSE,
+              message: '关注列表达到安全页数上限',
+              phase: 'followed',
+              retryable: true,
+            },
+          ],
+    };
+  }
+
+  async processHole({ job, hole, source, options, signal, references }) {
+    const pid = normalizePid(hole.pid);
+    let comments = [];
+    let fetchStatus = 'ok';
+    let error = null;
+    if (options.includeComments && Number(hole.reply || 0) > 0) {
+      try {
+        const result = await this.api.getAllComments(pid, {
+          signal,
+          onPage: (progress) => this.emit({ type: 'comments', pid, ...progress }),
+        });
+        comments = result.items;
+        if (!result.complete) {
+          fetchStatus = 'partial';
+          error = {
+            code: ERROR_CODES.INVALID_RESPONSE,
+            message: `#${pid} 评论达到安全页数上限`,
+            pid,
+            phase: 'comments',
+            retryable: true,
+          };
+        }
+      } catch (caught) {
+        if (
+          isAppError(caught, ERROR_CODES.UNAUTHORIZED) ||
+          isAppError(caught, ERROR_CODES.RATE_LIMITED) ||
+          isAppError(caught, ERROR_CODES.CANCELLED)
+        ) {
+          throw caught;
+        }
+        fetchStatus = 'partial';
+        error = toErrorRecord(caught, { pid, phase: 'comments' });
+      }
+    }
+
+    const item = sanitizeForArchive({
+      pid,
+      source,
+      hole,
+      comments,
+      fetchStatus,
+    });
+    await this.store.putItem(job.id, pid, item);
+
+    if (options.referenceMode !== 'none') {
+      referencesFromText(hole.text).forEach((reference) => references.add(reference));
+      if (options.referenceMode === 'all') {
+        comments.forEach((comment) =>
+          referencesFromText(comment.text).forEach((reference) => references.add(reference)),
+        );
+      }
+    }
+    return error;
+  }
+
+  async run(rawOptions = null, { jobId = null, signal: externalSignal } = {}) {
+    this.pauseRequested = false;
+    this.controller = new AbortController();
+    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    const signal = this.controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
+
+    let job = jobId ? await this.store.getJob(jobId) : null;
+    const options = normalizedOptions(rawOptions || job?.options);
+    if (job && job.accountFingerprint !== this.accountFingerprint) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该断点属于另一个账号，不能恢复');
+    }
+    if (!job) {
+      const createdAt = this.now().toISOString();
+      job = {
+        id: createRunId(this.now()),
+        type: 'export',
+        state: JOB_STATES.PLANNING,
+        createdAt: Date.parse(createdAt),
+        accountFingerprint: this.accountFingerprint,
+        options,
+        errors: [],
+        total: 0,
+        completed: 0,
+      };
+      await this.store.putJob(job);
+    } else {
+      job.options = options;
+      job.errors = [];
+    }
+
+    try {
+      await this.saveState(job, JOB_STATES.PLANNING);
+      const plan = await this.planHoles(options, signal);
+      const basePids = new Set(plan.holes.map((hole) => String(hole.pid)));
+      const existingItems = await this.store.getItems(job.id);
+      const completedPids = new Set(
+        existingItems.filter((item) => item.fetchStatus === 'ok').map((item) => item.pid),
+      );
+      const errors = [...plan.errors];
+      job.total = plan.holes.length;
+      job.completed = completedPids.size;
+      await this.saveState(job, JOB_STATES.RUNNING, {
+        total: job.total,
+        completed: job.completed,
+      });
+
+      const references = new Set();
+      if (options.referenceMode !== 'none') {
+        for (const item of existingItems) {
+          referencesFromText(item.hole?.text).forEach((reference) => references.add(reference));
+          if (options.referenceMode === 'all') {
+            item.comments?.forEach((comment) =>
+              referencesFromText(comment.text).forEach((reference) => references.add(reference)),
+            );
+          }
+        }
+      }
+      for (const hole of plan.holes) {
+        throwIfAborted(signal, 'export');
+        if (this.pauseRequested) {
+          await this.saveState(job, JOB_STATES.PAUSED, { errors });
+          return { job, paused: true };
+        }
+        const pid = normalizePid(hole.pid);
+        if (!completedPids.has(pid)) {
+          const error = await this.processHole({
+            job,
+            hole,
+            source: options.scope.type === 'pids' ? 'explicit' : 'followed',
+            options,
+            signal,
+            references,
+          });
+          if (error) errors.push(error);
+          completedPids.add(pid);
+          job.completed = completedPids.size;
+          await this.store.putJob({ ...job, completed: job.completed, errors });
+          this.emit({ ...job, type: 'progress', phase: 'followed', pid });
+        }
+      }
+
+      for (const pid of basePids) references.delete(pid);
+      if (references.size > LIMITS.maxReferencedPids) {
+        errors.push({
+          code: ERROR_CODES.INVALID_INPUT,
+          message: `引用洞数量 ${references.size} 超过安全上限 ${LIMITS.maxReferencedPids}`,
+          phase: 'references',
+          retryable: false,
+        });
+      }
+      const referencePids = [...references].slice(0, LIMITS.maxReferencedPids);
+      if (
+        referencePids.length > LIMITS.confirmReferencedPids &&
+        !options.confirmedLargeReferences
+      ) {
+        const confirmed = await this.confirmReferences(referencePids.length);
+        if (!confirmed) referencePids.length = 0;
+      }
+      job.total += referencePids.length;
+      await this.store.putJob(job);
+
+      for (const pid of referencePids) {
+        throwIfAborted(signal, 'export_references');
+        if (this.pauseRequested) {
+          await this.saveState(job, JOB_STATES.PAUSED, { errors });
+          return { job, paused: true };
+        }
+        if (completedPids.has(pid)) continue;
+        try {
+          const hole = await this.api.getHole(pid, signal);
+          const error = await this.processHole({
+            job,
+            hole,
+            source: 'referenced',
+            options,
+            signal,
+            references: new Set(),
+          });
+          if (error) errors.push(error);
+          completedPids.add(pid);
+        } catch (error) {
+          if (
+            isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
+            isAppError(error, ERROR_CODES.RATE_LIMITED) ||
+            isAppError(error, ERROR_CODES.CANCELLED)
+          ) {
+            throw error;
+          }
+          errors.push(toErrorRecord(error, { pid, phase: 'referenced' }));
+        }
+        job.completed = completedPids.size;
+        await this.store.putJob({ ...job, completed: job.completed, errors });
+        this.emit({ ...job, type: 'progress', phase: 'referenced', pid });
+      }
+
+      const items = await this.store.getItems(job.id);
+      const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');
+      const manifest = createManifest({
+        runId: job.id,
+        accountFingerprint: this.accountFingerprint,
+        scope: options,
+        complete,
+        items,
+        errors,
+        expectedHoles: job.total,
+        exportedAt: this.now().toISOString(),
+      });
+      const archive = createArchive({
+        manifest,
+        items,
+        includeReadable: options.includeReadable,
+      });
+      await this.saveState(job, complete ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL, {
+        completed: items.length,
+        errors,
+        manifest,
+      });
+      return { job, manifest, archive, paused: false };
+    } catch (error) {
+      let state = JOB_STATES.FAILED;
+      if (isAppError(error, ERROR_CODES.CANCELLED)) state = JOB_STATES.CANCELLED;
+      else if (isAppError(error, ERROR_CODES.RATE_LIMITED)) state = JOB_STATES.PAUSED;
+      await this.saveState(job, state, {
+        errors: [...(job.errors || []), toErrorRecord(error, { phase: 'job' })],
+      });
+      throw error;
+    } finally {
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      this.controller = null;
+    }
+  }
+}
+
+
+// ---- import-job.js ----
+function importRunId() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const suffix = globalThis.crypto?.randomUUID?.().slice(0, 8) || Math.random().toString(16).slice(2, 10);
+  return `import-${stamp}-${suffix}`;
+}
+
+class ImportJob {
+  constructor({ api, store, accountFingerprint, onProgress = () => {} }) {
+    this.api = api;
+    this.store = store;
+    this.accountFingerprint = accountFingerprint;
+    this.onProgress = onProgress;
+    this.controller = null;
+    this.pauseRequested = false;
+  }
+
+  requestPause() {
+    this.pauseRequested = true;
+  }
+
+  cancel() {
+    this.controller?.abort('cancelled');
+  }
+
+  async preview(files, { signal } = {}) {
+    const unique = new Set();
+    let duplicateCount = 0;
+    const invalidFiles = [];
+    const archives = [];
+    for (const file of files || []) {
+      throwIfAborted(signal, 'import_preview');
+      try {
+        const archive = await parseArchiveFile(file);
+        archives.push({ name: file.name, format: archive.format });
+        for (const item of archive.data.items) {
+          try {
+            const pid = normalizePid(item.pid);
+            if (unique.has(pid)) duplicateCount += 1;
+            unique.add(pid);
+          } catch (error) {
+            invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+          }
+        }
+      } catch (error) {
+        invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+      }
+    }
+    if (unique.size > LIMITS.maxImportPids) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '导入 PID 数量超过 20000');
+    }
+    const followed = await this.api.getAllFollowed({ signal });
+    const followedPids = new Set(followed.items.map((hole) => String(hole.pid)));
+    const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
+    const newPids = [...unique].filter((pid) => !followedPids.has(pid));
+    return {
+      archives,
+      allPids: [...unique],
+      newPids,
+      alreadyFollowed,
+      duplicateCount,
+      invalidFiles,
+      remoteComplete: followed.complete,
+    };
+  }
+
+  async execute(preview, { signal: externalSignal, jobId = null } = {}) {
+    this.pauseRequested = false;
+    this.controller = new AbortController();
+    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    const signal = this.controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
+
+    let job = jobId ? await this.store.getJob(jobId) : null;
+    if (job && job.accountFingerprint !== this.accountFingerprint) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该导入断点属于另一个账号');
+    }
+    if (!job) {
+      job = {
+        id: importRunId(),
+        type: 'import',
+        state: JOB_STATES.PLANNING,
+        createdAt: Date.now(),
+        accountFingerprint: this.accountFingerprint,
+        pids: preview.newPids,
+        preview: {
+          archives: preview.archives,
+          allPids: preview.allPids,
+          newPids: preview.newPids,
+          alreadyFollowed: preview.alreadyFollowed,
+          duplicateCount: preview.duplicateCount,
+          invalidFiles: preview.invalidFiles,
+          remoteComplete: preview.remoteComplete,
+        },
+        total: preview.newPids.length,
+        completed: 0,
+        results: [],
+      };
+    }
+    await this.store.putJob({ ...job, state: JOB_STATES.RUNNING });
+    const previous = await this.store.getItems(job.id);
+    const completedPids = new Set(previous.map((result) => result.pid));
+    const results = [...previous];
+
+    try {
+      for (const pid of job.pids) {
+        throwIfAborted(signal, 'import');
+        if (this.pauseRequested) {
+          job.state = JOB_STATES.PAUSED;
+          job.results = results;
+          await this.store.putJob(job);
+          return { job, paused: true, audit: this.buildAudit(preview, results) };
+        }
+        if (completedPids.has(pid)) continue;
+        let result;
+        try {
+          const response = await this.api.followHole(pid, signal);
+          result = { pid, status: response.status };
+        } catch (error) {
+          if (
+            isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
+            isAppError(error, ERROR_CODES.RATE_LIMITED) ||
+            isAppError(error, ERROR_CODES.CANCELLED)
+          ) {
+            throw error;
+          }
+          result = { pid, status: 'failed', error: toErrorRecord(error) };
+        }
+        results.push(result);
+        completedPids.add(pid);
+        await this.store.putItem(job.id, pid, result);
+        job.completed = completedPids.size;
+        job.results = results;
+        await this.store.putJob(job);
+        this.onProgress({ ...job, type: 'progress', pid });
+      }
+      const audit = this.buildAudit(preview, results);
+      job.state = audit.failed === 0 && audit.unknown === 0 ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL;
+      job.audit = audit;
+      await this.store.putJob(job);
+      return { job, paused: false, audit };
+    } catch (error) {
+      if (isAppError(error, ERROR_CODES.CANCELLED)) job.state = JOB_STATES.CANCELLED;
+      else if (isAppError(error, ERROR_CODES.RATE_LIMITED)) job.state = JOB_STATES.PAUSED;
+      else job.state = JOB_STATES.FAILED;
+      job.fatalError = toErrorRecord(error);
+      await this.store.putJob(job);
+      throw error;
+    } finally {
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      this.controller = null;
+    }
+  }
+
+  buildAudit(preview, results) {
+    const count = (statuses) => results.filter((result) => statuses.includes(result.status)).length;
+    return {
+      totalFiles: preview.archives.length,
+      totalUnique: preview.allPids.length,
+      requested: preview.newPids.length,
+      alreadyFollowed: preview.alreadyFollowed.length,
+      duplicates: preview.duplicateCount,
+      invalidFiles: preview.invalidFiles,
+      followed: count(['followed', 'followed_reconciled']),
+      skipped: count(['already_followed']),
+      notFound: results.filter((result) => result.error?.code === ERROR_CODES.NOT_FOUND).length,
+      unknown: results.filter((result) => result.error?.code === ERROR_CODES.UNKNOWN_RESULT).length,
+      failed: count(['failed']),
+      results,
+    };
+  }
+}
+
+function buildImportAuditText(audit) {
+  return [
+    '北大树洞关注导入审计报告',
+    `文件数: ${audit.totalFiles}`,
+    `唯一 PID: ${audit.totalUnique}`,
+    `计划新增: ${audit.requested}`,
+    `已关注: ${audit.alreadyFollowed}`,
+    `成功关注: ${audit.followed}`,
+    `结果未知: ${audit.unknown}`,
+    `失败: ${audit.failed}`,
+    '',
+    ...audit.results.map(
+      (result) => `#${result.pid}\t${result.status}\t${result.error?.message || ''}`,
+    ),
+  ].join('\n');
+}
+
+
+// ---- ui.js ----
+const ENTRY_ID = 'pku-hole-toolkit-entry';
+const HOST_ID = 'pku-hole-toolkit-host';
+
+const PANEL_STYLES = `
+  :host { all: initial; color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  .overlay { position: fixed; inset: 0; z-index: 2147483646; display: none; place-items: center; padding: 20px; background: rgba(0,0,0,.5); font-family: system-ui, -apple-system, sans-serif; color: #202124; }
+  .overlay.open { display: grid; }
+  .panel { width: min(720px, 100%); max-height: min(820px, calc(100vh - 40px)); overflow: auto; border-radius: 14px; background: #fff; box-shadow: 0 24px 80px rgba(0,0,0,.32); }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid #e6e8eb; }
+  h2 { margin: 0; font-size: 20px; }
+  h3 { margin: 0 0 12px; font-size: 16px; }
+  .close { border: 0; background: transparent; font-size: 26px; line-height: 1; cursor: pointer; color: inherit; }
+  .tabs { display: flex; gap: 6px; padding: 12px 20px 0; }
+  .tabs button { flex: 1; }
+  main { padding: 18px 20px 22px; }
+  section[hidden], .conditional[hidden] { display: none; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+  .field { display: grid; gap: 6px; }
+  .field.full { grid-column: 1 / -1; }
+  label, legend { font-size: 14px; font-weight: 600; }
+  input, select, textarea, button { font: inherit; }
+  input, select, textarea { width: 100%; border: 1px solid #b8bec7; border-radius: 8px; padding: 9px 10px; background: #fff; color: #202124; }
+  textarea { min-height: 80px; resize: vertical; }
+  .checks { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 14px 0; }
+  .checks label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+  .checks input { width: auto; }
+  button { border: 1px solid #aeb4bd; border-radius: 8px; padding: 9px 14px; background: #f7f8fa; color: #202124; cursor: pointer; }
+  button.primary { border-color: #1a73e8; background: #1a73e8; color: #fff; }
+  button.danger { border-color: #c5221f; color: #c5221f; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(26,115,232,.35); outline-offset: 2px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .status-card { margin-top: 18px; padding: 14px; border-radius: 10px; background: #f2f6fc; border: 1px solid #dce6f5; }
+  .status-line { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+  progress { width: 100%; height: 12px; margin: 10px 0; }
+  .message { min-height: 1.5em; margin: 8px 0 0; white-space: pre-wrap; font-size: 14px; }
+  .message.error { color: #b3261e; }
+  .preview { margin-top: 14px; padding: 12px; border: 1px solid #d7dbe1; border-radius: 8px; white-space: pre-wrap; font-size: 14px; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .field.full { grid-column: auto; } }
+  @media (prefers-color-scheme: dark) {
+    .overlay { color: #e8eaed; }
+    .panel { background: #202124; }
+    header { border-color: #3c4043; }
+    input, select, textarea { background: #292a2d; border-color: #5f6368; color: #e8eaed; }
+    button { background: #303134; border-color: #5f6368; color: #e8eaed; }
+    button.primary { background: #8ab4f8; border-color: #8ab4f8; color: #202124; }
+    .status-card { background: #263248; border-color: #3b4e6d; }
+    .preview { border-color: #5f6368; }
+  }
+`;
+
+function panelTemplate() {
+  return `
+    <style>${PANEL_STYLES}</style>
+    <div class="overlay" aria-hidden="true">
+      <div class="panel" role="dialog" aria-modal="true" aria-labelledby="toolkit-title">
+        <header><h2 id="toolkit-title">北大树洞归档与迁移</h2><button class="close" type="button" aria-label="关闭">×</button></header>
+        <div class="tabs" role="tablist">
+          <button type="button" role="tab" data-tab="export" aria-selected="true">导出归档</button>
+          <button type="button" role="tab" data-tab="import" aria-selected="false">导入关注</button>
+        </div>
+        <main>
+          <section data-panel="export">
+            <h3>导出设置</h3>
+            <div class="grid">
+              <div class="field"><label for="scope">范围</label><select id="scope"><option value="all">全部关注</option><option value="group">收藏分组</option><option value="pids">指定 PID</option><option value="date">日期范围</option></select></div>
+              <div class="field conditional" data-for-scope="group" hidden><label for="bookmark">收藏分组</label><select id="bookmark"><option value="">正在加载分组…</option></select></div>
+              <div class="field full conditional" data-for-scope="pids" hidden><label for="export-pids">PID（空格、逗号或换行分隔）</label><textarea id="export-pids" placeholder="123456 234567"></textarea></div>
+              <div class="field conditional" data-for-scope="date" hidden><label for="start-date">开始日期</label><input id="start-date" type="date"></div>
+              <div class="field conditional" data-for-scope="date" hidden><label for="end-date">结束日期</label><input id="end-date" type="date"></div>
+              <div class="field"><label for="reference-mode">引用洞</label><select id="reference-mode"><option value="none">不抓取</option><option value="body">仅正文引用</option><option value="all">正文和评论引用</option></select></div>
+            </div>
+            <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>包含 readable.txt</label></div>
+            <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
+          </section>
+          <section data-panel="import" hidden>
+            <h3>导入关注</h3>
+            <div class="field"><label for="archive-files">选择旧版 JSON 或 v2 ZIP</label><input id="archive-files" type="file" multiple accept=".json,.zip,.treehole.zip,application/json,application/zip"></div>
+            <div class="actions"><button type="button" data-action="preview-import">解析并预检</button><button class="primary" type="button" data-action="execute-import" disabled>确认导入</button></div>
+            <div class="preview" data-import-preview hidden></div>
+          </section>
+          <div class="status-card" aria-busy="false">
+            <div class="status-line"><strong data-state>空闲</strong><span data-count>0 / 0</span></div>
+            <progress value="0" max="1" aria-label="任务进度"></progress>
+            <div class="actions"><button type="button" data-action="pause" disabled>暂停</button><button type="button" data-action="resume" disabled>继续</button><button class="danger" type="button" data-action="cancel" disabled>取消</button><button type="button" data-action="retry" disabled>仅重试失败项</button></div>
+            <p class="message" role="status" aria-live="polite"></p>
+          </div>
+        </main>
+      </div>
+    </div>`;
+}
+
+function downloadBlob(documentObject, blob, filename) {
+  const link = documentObject.createElement('a');
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = filename;
+  link.hidden = true;
+  documentObject.body.append(link);
+  link.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    link.remove();
+  }, 30_000);
+}
+
+function parsePidInput(value) {
+  return String(value || '')
+    .split(/[\s,，;；]+/)
+    .map((pid) => pid.trim().replace(/^#/, ''))
+    .filter(Boolean);
+}
+
+function mountToolkit({
+  api,
+  store,
+  credentialsProvider,
+  documentObject = globalThis.document,
+  windowObject = globalThis.window,
+}) {
+  if (!documentObject?.body) return null;
+  let entry = documentObject.getElementById(ENTRY_ID);
+  let host = documentObject.getElementById(HOST_ID);
+  let activeJob = null;
+  let activeKind = null;
+  let activeJobId = null;
+  let lastExportOptions = null;
+  let importPreview = null;
+  let bookmarksLoaded = false;
+  const mountedAt = Date.now();
+
+  if (!entry) {
+    entry = documentObject.createElement('button');
+    entry.id = ENTRY_ID;
+    entry.type = 'button';
+    entry.textContent = '归档/迁移';
+    entry.style.minWidth = '78px';
+    entry.style.marginInline = '4px';
+  }
+  if (!host) {
+    host = documentObject.createElement('div');
+    host.id = HOST_ID;
+    documentObject.body.append(host);
+  }
+  const shadow = host.shadowRoot || host.attachShadow({ mode: 'open' });
+  if (!shadow.querySelector('.overlay')) shadow.innerHTML = panelTemplate();
+
+  const $ = (selector) => shadow.querySelector(selector);
+  const overlay = $('.overlay');
+  const statusCard = $('.status-card');
+  const statusLabel = $('[data-state]');
+  const countLabel = $('[data-count]');
+  const progress = $('progress');
+  const message = $('.message');
+  const pauseButton = $('[data-action="pause"]');
+  const resumeButton = $('[data-action="resume"]');
+  const cancelButton = $('[data-action="cancel"]');
+  const retryButton = $('[data-action="retry"]');
+  const importExecuteButton = $('[data-action="execute-import"]');
+
+  function placeEntry() {
+    const anchor = documentObject.querySelector('div.search-btn');
+    if (anchor) {
+      anchor.insertAdjacentElement('beforebegin', entry);
+      Object.assign(entry.style, { position: '', right: '', bottom: '', zIndex: '' });
+    } else if (!entry.isConnected && Date.now() - mountedAt >= 10_000) {
+      documentObject.body.append(entry);
+      Object.assign(entry.style, {
+        position: 'fixed',
+        right: '18px',
+        bottom: '18px',
+        zIndex: '2147483645',
+      });
+    }
+  }
+
+  function setMessage(text, isError = false) {
+    message.textContent = text || '';
+    message.classList.toggle('error', isError);
+  }
+
+  function setRunning(running) {
+    statusCard.setAttribute('aria-busy', String(running));
+    pauseButton.disabled = !running;
+    cancelButton.disabled = !running;
+    resumeButton.disabled = running || !activeJobId;
+    retryButton.disabled = running || !activeJobId;
+    $('[data-action="export"]').disabled = running;
+    $('[data-action="preview-import"]').disabled = running;
+    importExecuteButton.disabled = running || !importPreview;
+  }
+
+  function handleProgress(event) {
+    const total = Number(event.total || 0);
+    const completed = Number(event.completed || event.count || 0);
+    progress.max = Math.max(1, total);
+    progress.value = Math.min(completed, progress.max);
+    countLabel.textContent = `${completed} / ${total || '?'}`;
+    if (event.state) statusLabel.textContent = event.state;
+    if (event.pid) setMessage(`正在处理 #${event.pid}（${event.phase || ''}）`);
+  }
+
+  async function ensureBookmarks() {
+    if (bookmarksLoaded) return;
+    const select = $('#bookmark');
+    try {
+      const bookmarks = await api.listBookmarks();
+      select.replaceChildren(
+        ...bookmarks.map((bookmark) => {
+          const option = documentObject.createElement('option');
+          option.value = bookmark.id;
+          option.textContent = bookmark.name;
+          return option;
+        }),
+      );
+      if (!bookmarks.length) {
+        const option = documentObject.createElement('option');
+        option.value = '';
+        option.textContent = '暂无收藏分组';
+        select.append(option);
+      }
+      bookmarksLoaded = true;
+    } catch (error) {
+      select.replaceChildren();
+      const option = documentObject.createElement('option');
+      option.value = '';
+      option.textContent = '分组加载失败';
+      select.append(option);
+      setMessage(error.message, true);
+    }
+  }
+
+  async function discoverResumableJob() {
+    try {
+      const credentials = await credentialsProvider();
+      const jobs = (await store.listJobs())
+        .filter(
+          (job) =>
+            job.accountFingerprint === credentials.accountFingerprint &&
+            ['running', 'paused', 'partial'].includes(job.state),
+        )
+        .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
+      const job = jobs[0];
+      if (!job) return;
+      activeJobId = job.id;
+      activeKind = job.type;
+      if (job.type === 'export') lastExportOptions = job.options;
+      if (job.type === 'import') importPreview = job.preview;
+      if (job.state === 'running') {
+        job.state = 'paused';
+        await store.putJob(job);
+      }
+      statusLabel.textContent = 'paused';
+      countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
+      setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
+      resumeButton.disabled = false;
+      retryButton.disabled = false;
+      importExecuteButton.disabled = !importPreview;
+    } catch (error) {
+      if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
+    }
+  }
+
+  function exportOptions() {
+    const type = $('#scope').value;
+    const scope = { type };
+    if (type === 'group') scope.bookmarkId = $('#bookmark').value;
+    if (type === 'pids') scope.pids = parsePidInput($('#export-pids').value);
+    if (type === 'date') {
+      scope.startDate = $('#start-date').value || null;
+      scope.endDate = $('#end-date').value || null;
+    }
+    return {
+      scope,
+      includeComments: $('#include-comments').checked,
+      includeReadable: $('#include-readable').checked,
+      referenceMode: $('#reference-mode').value,
+    };
+  }
+
+  async function runExport(options, jobId = null) {
+    setRunning(true);
+    setMessage('正在规划导出范围…');
+    statusLabel.textContent = 'planning';
+    try {
+      const credentials = await credentialsProvider();
+      activeKind = 'export';
+      activeJob = new ExportJob({
+        api,
+        store,
+        accountFingerprint: credentials.accountFingerprint,
+        onProgress: handleProgress,
+        confirmReferences: async (count) =>
+          windowObject.confirm(`检测到 ${count} 个引用洞，是否继续抓取？`),
+      });
+      const result = await activeJob.run(options, { jobId });
+      activeJobId = result.job.id;
+      if (result.paused) {
+        statusLabel.textContent = 'paused';
+        setMessage('任务已暂停，可稍后继续。');
+        return;
+      }
+      downloadBlob(documentObject, result.archive.blob, result.archive.filename);
+      statusLabel.textContent = result.job.state;
+      countLabel.textContent = `${result.manifest.counts.exportedHoles} / ${result.manifest.counts.expectedHoles ?? '?'}`;
+      setMessage(
+        result.manifest.complete
+          ? '导出完成。断点保留 7 天，可重新下载。'
+          : `部分导出：${result.manifest.errors.length} 项失败，请查看 manifest 或重试。`,
+        !result.manifest.complete,
+      );
+    } catch (error) {
+      setMessage(error.message || '导出失败', true);
+      statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
+    } finally {
+      activeJob = null;
+      setRunning(false);
+    }
+  }
+
+  async function previewImport() {
+    const files = [...$('#archive-files').files];
+    if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
+    setRunning(true);
+    try {
+      const credentials = await credentialsProvider();
+      activeKind = 'import';
+      activeJob = new ImportJob({
+        api,
+        store,
+        accountFingerprint: credentials.accountFingerprint,
+        onProgress: handleProgress,
+      });
+      importPreview = await activeJob.preview(files);
+      const previewElement = $('[data-import-preview]');
+      previewElement.hidden = false;
+      previewElement.textContent = [
+        `文件：${importPreview.archives.length}`,
+        `唯一 PID：${importPreview.allPids.length}`,
+        `将新增：${importPreview.newPids.length}`,
+        `已关注：${importPreview.alreadyFollowed.length}`,
+        `重复：${importPreview.duplicateCount}`,
+        `无效文件/记录：${importPreview.invalidFiles.length}`,
+      ].join('\n');
+      setMessage('预检完成。请核对数量后确认导入。');
+    } finally {
+      activeJob = null;
+      setRunning(false);
+    }
+  }
+
+  async function executeImport(jobId = null) {
+    if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
+    if (
+      !windowObject.confirm(
+        `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
+      )
+    ) {
+      return;
+    }
+    setRunning(true);
+    try {
+      const credentials = await credentialsProvider();
+      activeKind = 'import';
+      activeJob = new ImportJob({
+        api,
+        store,
+        accountFingerprint: credentials.accountFingerprint,
+        onProgress: handleProgress,
+      });
+      const result = await activeJob.execute(importPreview, { jobId });
+      activeJobId = result.job.id;
+      statusLabel.textContent = result.job.state;
+      if (!result.paused) {
+        const text = buildImportAuditText(result.audit);
+        downloadBlob(
+          documentObject,
+          new Blob([text], { type: 'text/plain;charset=utf-8' }),
+          `${result.job.id}-audit.txt`,
+        );
+      }
+      setMessage(
+        result.paused
+          ? '导入已暂停。'
+          : `导入结束：成功 ${result.audit.followed}，失败 ${result.audit.failed}，未知 ${result.audit.unknown}。`,
+        !result.paused && (result.audit.failed > 0 || result.audit.unknown > 0),
+      );
+    } catch (error) {
+      setMessage(error.message || '导入失败', true);
+      statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
+    } finally {
+      activeJob = null;
+      setRunning(false);
+    }
+  }
+
+  function openPanel() {
+    overlay.classList.add('open');
+    overlay.setAttribute('aria-hidden', 'false');
+    $('.close').focus();
+    discoverResumableJob();
+  }
+
+  function closePanel() {
+    overlay.classList.remove('open');
+    overlay.setAttribute('aria-hidden', 'true');
+    entry.focus();
+  }
+
+  entry.addEventListener('click', openPanel);
+  $('.close').addEventListener('click', closePanel);
+  shadow.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closePanel();
+  });
+  $('#scope').addEventListener('change', (event) => {
+    shadow.querySelectorAll('[data-for-scope]').forEach((element) => {
+      element.hidden = element.dataset.forScope !== event.target.value;
+    });
+    if (event.target.value === 'group') ensureBookmarks();
+  });
+  shadow.querySelectorAll('[data-tab]').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      shadow.querySelectorAll('[data-tab]').forEach((other) =>
+        other.setAttribute('aria-selected', String(other === tab)),
+      );
+      shadow.querySelectorAll('[data-panel]').forEach((panel) => {
+        panel.hidden = panel.dataset.panel !== tab.dataset.tab;
+      });
+    });
+  });
+  $('[data-action="export"]').addEventListener('click', () => {
+    lastExportOptions = exportOptions();
+    runExport(lastExportOptions);
+  });
+  $('[data-action="preview-import"]').addEventListener('click', () =>
+    previewImport().catch((error) => setMessage(error.message, true)),
+  );
+  importExecuteButton.addEventListener('click', () => executeImport());
+  pauseButton.addEventListener('click', () => {
+    activeJob?.requestPause();
+    setMessage('将在当前洞处理完成后暂停…');
+  });
+  cancelButton.addEventListener('click', () => activeJob?.cancel());
+  resumeButton.addEventListener('click', () => {
+    if (activeKind === 'export') runExport(lastExportOptions, activeJobId);
+    else if (activeKind === 'import') executeImport(activeJobId);
+  });
+  retryButton.addEventListener('click', () => {
+    if (activeKind === 'export') runExport(lastExportOptions, activeJobId);
+    else if (activeKind === 'import') executeImport(activeJobId);
+  });
+
+  placeEntry();
+  const fallbackTimer = setTimeout(placeEntry, 10_000);
+  const Observer = windowObject.MutationObserver || globalThis.MutationObserver;
+  const observer = new Observer(placeEntry);
+  observer.observe(documentObject.body, { childList: true, subtree: true });
+
+  return {
+    entry,
+    host,
+    open: openPanel,
+    close: closePanel,
+    destroy() {
+      clearTimeout(fallbackTimer);
+      observer.disconnect();
+      entry.remove();
+      host.remove();
+    },
+    reportError(error) {
+      const record = toErrorRecord(error);
+      openPanel();
+      setMessage(record.message, true);
+    },
+  };
+}
+
+
+// ---- main.js ----
+function startToolkit({
+  documentObject = globalThis.document,
+  windowObject = globalThis.window,
+  fetchImpl = globalThis.fetch?.bind(globalThis),
+  indexedDBObject = globalThis.indexedDB,
+} = {}) {
+  let credentialsPromise = null;
+  const credentialsProvider = () => {
+    if (!credentialsPromise) {
+      credentialsPromise = getCredentials({
+        documentObject,
+        storage: windowObject.localStorage,
+        cryptoObject: windowObject.crypto,
+      }).catch((error) => {
+        credentialsPromise = null;
+        throw error;
+      });
+    }
+    return credentialsPromise;
+  };
+  const scheduler = new RequestScheduler({ fetchImpl });
+  const api = new TreeholeApi({ scheduler, credentialsProvider });
+  const store = new JobStore({ indexedDBObject });
+  store.cleanup().catch((error) => console.warn('[PKU Hole Toolkit] 清理旧任务失败', error));
+  return mountToolkit({ api, store, credentialsProvider, documentObject, windowObject });
+}
+
+function bootstrap() {
+  try {
+    startToolkit();
+  } catch (error) {
+    console.error('[PKU Hole Toolkit] 启动失败', error);
+  }
+}
+
+if (globalThis.document?.body) bootstrap();
+else globalThis.document?.addEventListener('DOMContentLoaded', bootstrap, { once: true });
+
 })();
