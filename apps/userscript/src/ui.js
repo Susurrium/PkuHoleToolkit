@@ -200,7 +200,10 @@ export function mountToolkit({
     $('[data-action="export"]').disabled = running;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
-      running || !importPreview || importPreview.newPids?.length === 0;
+      running ||
+      !importPreview ||
+      importPreview.remoteComplete !== true ||
+      importPreview.newPids?.length === 0;
   }
 
   function handleProgress(event) {
@@ -274,6 +277,9 @@ export function mountToolkit({
       resumeButton.disabled = false;
       retryButton.disabled = false;
       importExecuteButton.disabled = !importPreview;
+      if (importPreview?.remoteComplete !== true || importPreview?.newPids?.length === 0) {
+        importExecuteButton.disabled = true;
+      }
     } catch (error) {
       if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
     }
@@ -362,6 +368,7 @@ export function mountToolkit({
         `唯一 PID：${importPreview.allPids.length}`,
         `将新增：${importPreview.newPids.length}`,
         `已关注：${importPreview.alreadyFollowed.length}`,
+        `仅归档引用（不导入）：${importPreview.excludedReferenced}`,
         `重复：${importPreview.duplicateCount}`,
         `无效文件/记录：${importPreview.invalidFiles.length}`,
       ].join('\n');
@@ -370,9 +377,12 @@ export function mountToolkit({
       progress.value = 1;
       countLabel.textContent = `${importPreview.allPids.length} PID`;
       setMessage(
-        importPreview.newPids.length
+        importPreview.remoteComplete !== true
+          ? '预检未完成：当前关注列表读取不完整，已禁止导入，请稍后重试。'
+          : importPreview.newPids.length
           ? '预检完成。请核对数量后确认导入。'
           : '预检完成：所有 PID 均已关注，无需执行导入。',
+        importPreview.remoteComplete !== true,
       );
     } finally {
       activeJob = null;

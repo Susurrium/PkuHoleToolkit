@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞归档与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.3.0-beta.4
+// @version      1.3.0
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -19,7 +19,7 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.3.0-beta.4';
+const APP_VERSION = '1.3.0';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';
@@ -1548,6 +1548,8 @@ function importRunId() {
   return `import-${stamp}-${suffix}`;
 }
 
+const IMPORTABLE_SOURCES = new Set(['followed', 'explicit', 'legacy-v1']);
+
 class ImportJob {
   constructor({ api, store, accountFingerprint, onProgress = () => {} }) {
     this.api = api;
@@ -1577,6 +1579,7 @@ class ImportJob {
     const inputFiles = [...(files || [])];
     const unique = new Set();
     let duplicateCount = 0;
+    let excludedReferenced = 0;
     const invalidFiles = [];
     const archives = [];
     try {
@@ -1586,6 +1589,11 @@ class ImportJob {
           const archive = await parseArchiveFile(file);
           archives.push({ name: file.name, format: archive.format });
           for (const item of archive.data.items) {
+            if (item.source === 'referenced') {
+              excludedReferenced += 1;
+              continue;
+            }
+            if (!IMPORTABLE_SOURCES.has(item.source)) continue;
             try {
               const pid = normalizePid(item.pid);
               if (unique.has(pid)) duplicateCount += 1;
@@ -1628,6 +1636,7 @@ class ImportJob {
         newPids,
         alreadyFollowed,
         duplicateCount,
+        excludedReferenced,
         invalidFiles,
         remoteComplete: followed.complete,
       };
@@ -1638,6 +1647,12 @@ class ImportJob {
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {
+    if (!preview || preview.remoteComplete !== true) {
+      throw new AppError(
+        ERROR_CODES.INVALID_RESPONSE,
+        '当前关注列表读取不完整，已禁止导入；请重新预检后再试',
+      );
+    }
     this.pauseRequested = false;
     this.controller = new AbortController();
     const onExternalAbort = () => this.controller.abort(externalSignal.reason);
@@ -1663,6 +1678,7 @@ class ImportJob {
           newPids: preview.newPids,
           alreadyFollowed: preview.alreadyFollowed,
           duplicateCount: preview.duplicateCount,
+          excludedReferenced: preview.excludedReferenced,
           invalidFiles: preview.invalidFiles,
           remoteComplete: preview.remoteComplete,
         },
@@ -1735,6 +1751,7 @@ class ImportJob {
       requested: preview.newPids.length,
       alreadyFollowed: preview.alreadyFollowed.length,
       duplicates: preview.duplicateCount,
+      excludedReferenced: preview.excludedReferenced || 0,
       invalidFiles: preview.invalidFiles,
       followed: count(['followed', 'followed_reconciled']),
       skipped: count(['already_followed']),
@@ -1753,6 +1770,7 @@ function buildImportAuditText(audit) {
     `唯一 PID: ${audit.totalUnique}`,
     `计划新增: ${audit.requested}`,
     `已关注: ${audit.alreadyFollowed}`,
+    `仅归档引用（未导入）: ${audit.excludedReferenced}`,
     `成功关注: ${audit.followed}`,
     `结果未知: ${audit.unknown}`,
     `失败: ${audit.failed}`,
@@ -1963,7 +1981,10 @@ function mountToolkit({
     $('[data-action="export"]').disabled = running;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
-      running || !importPreview || importPreview.newPids?.length === 0;
+      running ||
+      !importPreview ||
+      importPreview.remoteComplete !== true ||
+      importPreview.newPids?.length === 0;
   }
 
   function handleProgress(event) {
@@ -2037,6 +2058,9 @@ function mountToolkit({
       resumeButton.disabled = false;
       retryButton.disabled = false;
       importExecuteButton.disabled = !importPreview;
+      if (importPreview?.remoteComplete !== true || importPreview?.newPids?.length === 0) {
+        importExecuteButton.disabled = true;
+      }
     } catch (error) {
       if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
     }
@@ -2125,6 +2149,7 @@ function mountToolkit({
         `唯一 PID：${importPreview.allPids.length}`,
         `将新增：${importPreview.newPids.length}`,
         `已关注：${importPreview.alreadyFollowed.length}`,
+        `仅归档引用（不导入）：${importPreview.excludedReferenced}`,
         `重复：${importPreview.duplicateCount}`,
         `无效文件/记录：${importPreview.invalidFiles.length}`,
       ].join('\n');
@@ -2133,9 +2158,12 @@ function mountToolkit({
       progress.value = 1;
       countLabel.textContent = `${importPreview.allPids.length} PID`;
       setMessage(
-        importPreview.newPids.length
+        importPreview.remoteComplete !== true
+          ? '预检未完成：当前关注列表读取不完整，已禁止导入，请稍后重试。'
+          : importPreview.newPids.length
           ? '预检完成。请核对数量后确认导入。'
           : '预检完成：所有 PID 均已关注，无需执行导入。',
+        importPreview.remoteComplete !== true,
       );
     } finally {
       activeJob = null;

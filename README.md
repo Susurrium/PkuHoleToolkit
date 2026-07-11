@@ -8,12 +8,12 @@
 - 可选择正文、评论以及正文/评论中的一层 `#PID` 引用。
 - 默认生成一个 `.treehole.zip`，包含 `manifest.json`、`data.json` 和可选的 `readable.txt`。
 - 支持暂停、取消、七天内恢复，以及只重试未完整项目。
-- 支持导入新版 ZIP 和旧版 `{ holes, comments }` JSON；关注前会预检、去重和二次确认。
+- 支持导入新版 ZIP 和旧版 `{ holes, comments }` JSON；关注前会预检、去重和二次确认。仅归档的 `referenced` 上下文不会被关注。
 - 所有账号写请求只发送一次，响应不确定时通过读取接口核对最终状态。
 
 ## 安装
 
-当前公开测试版本为 `v1.3.0-beta.4`。测试者可从 [GitHub Pre-release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.3.0-beta.4) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。`beta.1` 存在入口观察器自触发导致页面白屏的问题，已经撤回。
+当前正式版本为 `v1.3.0`。可从 [GitHub Release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.3.0) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。真实环境验收记录见 [`BETA_TEST_CHECKLIST.md`](./BETA_TEST_CHECKLIST.md)。
 
 1. 安装 Tampermonkey 或 Violentmonkey。
 2. 打开根目录生成文件 `PKU-Hole export tool.user.js` 并安装。
@@ -29,6 +29,7 @@
 - 归档包含用户关注内容和评论，可能十分敏感；请勿随意上传到第三方网站或公共云盘。
 - 为保护账号，请不要在多个标签页同时启动大批量任务。
 - 429、401 或 403 会暂停/停止任务；不要通过提高并发绕过服务端限制。
+- 当前关注列表读取不完整时会强制禁止导入，避免把漏读项目误判为未关注。
 
 ## 开发
 

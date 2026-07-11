@@ -4,7 +4,11 @@ import assert from 'node:assert/strict';
 import { ExportJob, referencesFromText } from '../apps/userscript/src/export-job.js';
 import { ImportJob } from '../apps/userscript/src/import-job.js';
 import { MemoryJobStore } from '../apps/userscript/src/storage.js';
-import { parseArchiveBytes } from '../apps/userscript/src/archive.js';
+import {
+  createArchive,
+  createManifest,
+  parseArchiveBytes,
+} from '../apps/userscript/src/archive.js';
 
 test('reference parser supports hash references and API-normalized leading PIDs', () => {
   assert.deepEqual(referencesFromText('#8395001 body'), ['8395001']);
@@ -122,10 +126,78 @@ test('import preview deduplicates legacy files and execute records an audit', as
   assert.ok(previewProgress.some((event) => event.phase === 'remote_followed'));
   assert.deepEqual(preview.newPids, ['234567']);
   assert.equal(preview.alreadyFollowed.length, 1);
+  assert.equal(preview.excludedReferenced, 0);
   const result = await job.execute(preview);
   assert.deepEqual(followed, ['234567']);
   assert.equal(result.audit.followed, 1);
   assert.equal(result.audit.failed, 0);
+});
+
+test('import preview excludes referenced context from follow candidates', async () => {
+  const items = [
+    {
+      pid: '123456',
+      source: 'followed',
+      hole: { pid: 123456, text: 'followed', timestamp: 1 },
+      comments: [],
+      fetchStatus: 'ok',
+    },
+    {
+      pid: '234567',
+      source: 'referenced',
+      hole: { pid: 234567, text: 'context only', timestamp: 2 },
+      comments: [],
+      fetchStatus: 'ok',
+    },
+  ];
+  const manifest = createManifest({
+    runId: 'import-sources',
+    scope: { type: 'group' },
+    complete: true,
+    items,
+    expectedHoles: 2,
+  });
+  const archive = createArchive({ manifest, items, includeReadable: false });
+  const file = {
+    name: archive.filename,
+    size: archive.bytes.byteLength,
+    async arrayBuffer() {
+      return archive.bytes.slice().buffer;
+    },
+  };
+  const job = new ImportJob({
+    api: {
+      scheduler: { resetRateLimitCount() {} },
+      async getAllFollowed() {
+        return { complete: true, items: [] };
+      },
+    },
+    store: new MemoryJobStore(),
+    accountFingerprint: 'fingerprint',
+  });
+  const preview = await job.preview([file]);
+  assert.deepEqual(preview.allPids, ['123456']);
+  assert.deepEqual(preview.newPids, ['123456']);
+  assert.equal(preview.excludedReferenced, 1);
+});
+
+test('import execution refuses an incomplete remote follow snapshot', async () => {
+  let followCalls = 0;
+  const job = new ImportJob({
+    api: {
+      async followHole() {
+        followCalls += 1;
+        return { status: 'followed' };
+      },
+    },
+    store: new MemoryJobStore(),
+    accountFingerprint: 'fingerprint',
+  });
+  await assert.rejects(
+    job.execute({ remoteComplete: false, newPids: ['123456'] }),
+    (error) => error.code === 'invalid_response',
+  );
+  assert.equal(followCalls, 0);
 });
 
 test('a 2000-hole export completes without comment requests when reply count is zero', async () => {

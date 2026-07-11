@@ -9,6 +9,8 @@ function importRunId() {
   return `import-${stamp}-${suffix}`;
 }
 
+const IMPORTABLE_SOURCES = new Set(['followed', 'explicit', 'legacy-v1']);
+
 export class ImportJob {
   constructor({ api, store, accountFingerprint, onProgress = () => {} }) {
     this.api = api;
@@ -38,6 +40,7 @@ export class ImportJob {
     const inputFiles = [...(files || [])];
     const unique = new Set();
     let duplicateCount = 0;
+    let excludedReferenced = 0;
     const invalidFiles = [];
     const archives = [];
     try {
@@ -47,6 +50,11 @@ export class ImportJob {
           const archive = await parseArchiveFile(file);
           archives.push({ name: file.name, format: archive.format });
           for (const item of archive.data.items) {
+            if (item.source === 'referenced') {
+              excludedReferenced += 1;
+              continue;
+            }
+            if (!IMPORTABLE_SOURCES.has(item.source)) continue;
             try {
               const pid = normalizePid(item.pid);
               if (unique.has(pid)) duplicateCount += 1;
@@ -89,6 +97,7 @@ export class ImportJob {
         newPids,
         alreadyFollowed,
         duplicateCount,
+        excludedReferenced,
         invalidFiles,
         remoteComplete: followed.complete,
       };
@@ -99,6 +108,12 @@ export class ImportJob {
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {
+    if (!preview || preview.remoteComplete !== true) {
+      throw new AppError(
+        ERROR_CODES.INVALID_RESPONSE,
+        '当前关注列表读取不完整，已禁止导入；请重新预检后再试',
+      );
+    }
     this.pauseRequested = false;
     this.controller = new AbortController();
     const onExternalAbort = () => this.controller.abort(externalSignal.reason);
@@ -124,6 +139,7 @@ export class ImportJob {
           newPids: preview.newPids,
           alreadyFollowed: preview.alreadyFollowed,
           duplicateCount: preview.duplicateCount,
+          excludedReferenced: preview.excludedReferenced,
           invalidFiles: preview.invalidFiles,
           remoteComplete: preview.remoteComplete,
         },
@@ -196,6 +212,7 @@ export class ImportJob {
       requested: preview.newPids.length,
       alreadyFollowed: preview.alreadyFollowed.length,
       duplicates: preview.duplicateCount,
+      excludedReferenced: preview.excludedReferenced || 0,
       invalidFiles: preview.invalidFiles,
       followed: count(['followed', 'followed_reconciled']),
       skipped: count(['already_followed']),
@@ -214,6 +231,7 @@ export function buildImportAuditText(audit) {
     `唯一 PID: ${audit.totalUnique}`,
     `计划新增: ${audit.requested}`,
     `已关注: ${audit.alreadyFollowed}`,
+    `仅归档引用（未导入）: ${audit.excludedReferenced}`,
     `成功关注: ${audit.followed}`,
     `结果未知: ${audit.unknown}`,
     `失败: ${audit.failed}`,
