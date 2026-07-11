@@ -38,6 +38,8 @@ npm run check
 
 源码位于 `apps/userscript/src`，根目录 `.user.js` 是构建产物，不应手工修改。归档协议位于 `packages/archive-schema/schema-v2.json`。
 
+`tests/fixtures/smoke.html` 可用于手工检查入口挂载和弹窗渲染；真实 API 流程仍应在 GreasyFork beta 与测试账号中验证。
+
 ## 发布
 
 - GitHub 是源码和版本真源。
