@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞归档与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.3.0-beta.1
+// @version      1.3.0-beta.2
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -19,7 +19,7 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.3.0-beta.1';
+const APP_VERSION = '1.3.0-beta.2';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';
@@ -1735,6 +1735,13 @@ function buildImportAuditText(audit) {
 const ENTRY_ID = 'pku-hole-toolkit-entry';
 const HOST_ID = 'pku-hole-toolkit-host';
 
+function ensureEntryBeforeAnchor(entry, anchor) {
+  if (!entry || !anchor?.parentNode) return false;
+  if (entry.parentNode === anchor.parentNode && entry.nextSibling === anchor) return false;
+  anchor.parentNode.insertBefore(entry, anchor);
+  return true;
+}
+
 const PANEL_STYLES = `
   :host { all: initial; color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -1896,7 +1903,7 @@ function mountToolkit({
   function placeEntry() {
     const anchor = documentObject.querySelector('div.search-btn');
     if (anchor) {
-      anchor.insertAdjacentElement('beforebegin', entry);
+      ensureEntryBeforeAnchor(entry, anchor);
       Object.assign(entry.style, { position: '', right: '', bottom: '', zIndex: '' });
     } else if (!entry.isConnected && Date.now() - mountedAt >= 10_000) {
       documentObject.body.append(entry);
@@ -2190,7 +2197,21 @@ function mountToolkit({
   placeEntry();
   const fallbackTimer = setTimeout(placeEntry, 10_000);
   const Observer = windowObject.MutationObserver || globalThis.MutationObserver;
-  const observer = new Observer(placeEntry);
+  let placementScheduled = false;
+  const schedulePlacement = () => {
+    if (placementScheduled) return;
+    placementScheduled = true;
+    const run = () => {
+      placementScheduled = false;
+      placeEntry();
+    };
+    if (typeof windowObject.requestAnimationFrame === 'function') {
+      windowObject.requestAnimationFrame(run);
+    } else {
+      windowObject.setTimeout(run, 0);
+    }
+  };
+  const observer = new Observer(schedulePlacement);
   observer.observe(documentObject.body, { childList: true, subtree: true });
 
   return {

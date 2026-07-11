@@ -5,6 +5,13 @@ import { AppError, ERROR_CODES, toErrorRecord } from './errors.js';
 const ENTRY_ID = 'pku-hole-toolkit-entry';
 const HOST_ID = 'pku-hole-toolkit-host';
 
+export function ensureEntryBeforeAnchor(entry, anchor) {
+  if (!entry || !anchor?.parentNode) return false;
+  if (entry.parentNode === anchor.parentNode && entry.nextSibling === anchor) return false;
+  anchor.parentNode.insertBefore(entry, anchor);
+  return true;
+}
+
 const PANEL_STYLES = `
   :host { all: initial; color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -166,7 +173,7 @@ export function mountToolkit({
   function placeEntry() {
     const anchor = documentObject.querySelector('div.search-btn');
     if (anchor) {
-      anchor.insertAdjacentElement('beforebegin', entry);
+      ensureEntryBeforeAnchor(entry, anchor);
       Object.assign(entry.style, { position: '', right: '', bottom: '', zIndex: '' });
     } else if (!entry.isConnected && Date.now() - mountedAt >= 10_000) {
       documentObject.body.append(entry);
@@ -460,7 +467,21 @@ export function mountToolkit({
   placeEntry();
   const fallbackTimer = setTimeout(placeEntry, 10_000);
   const Observer = windowObject.MutationObserver || globalThis.MutationObserver;
-  const observer = new Observer(placeEntry);
+  let placementScheduled = false;
+  const schedulePlacement = () => {
+    if (placementScheduled) return;
+    placementScheduled = true;
+    const run = () => {
+      placementScheduled = false;
+      placeEntry();
+    };
+    if (typeof windowObject.requestAnimationFrame === 'function') {
+      windowObject.requestAnimationFrame(run);
+    } else {
+      windowObject.setTimeout(run, 0);
+    }
+  };
+  const observer = new Observer(schedulePlacement);
   observer.observe(documentObject.body, { childList: true, subtree: true });
 
   return {
