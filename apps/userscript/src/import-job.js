@@ -28,45 +28,74 @@ export class ImportJob {
     this.controller?.abort('cancelled');
   }
 
-  async preview(files, { signal } = {}) {
+  async preview(files, { signal: externalSignal } = {}) {
+    const controller = new AbortController();
+    const onExternalAbort = () => controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    this.controller = controller;
+    const signal = controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
+    const inputFiles = [...(files || [])];
     const unique = new Set();
     let duplicateCount = 0;
     const invalidFiles = [];
     const archives = [];
-    for (const file of files || []) {
-      throwIfAborted(signal, 'import_preview');
-      try {
-        const archive = await parseArchiveFile(file);
-        archives.push({ name: file.name, format: archive.format });
-        for (const item of archive.data.items) {
-          try {
-            const pid = normalizePid(item.pid);
-            if (unique.has(pid)) duplicateCount += 1;
-            unique.add(pid);
-          } catch (error) {
-            invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+    try {
+      for (const [index, file] of inputFiles.entries()) {
+        throwIfAborted(signal, 'import_preview');
+        try {
+          const archive = await parseArchiveFile(file);
+          archives.push({ name: file.name, format: archive.format });
+          for (const item of archive.data.items) {
+            try {
+              const pid = normalizePid(item.pid);
+              if (unique.has(pid)) duplicateCount += 1;
+              unique.add(pid);
+            } catch (error) {
+              invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+            }
           }
+        } catch (error) {
+          invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
         }
-      } catch (error) {
-        invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+        this.onProgress({
+          type: 'progress',
+          state: 'previewing',
+          phase: 'archive_files',
+          completed: index + 1,
+          total: inputFiles.length,
+        });
       }
+      if (unique.size > LIMITS.maxImportPids) {
+        throw new AppError(ERROR_CODES.INVALID_INPUT, '导入 PID 数量超过 20000');
+      }
+      const followed = await this.api.getAllFollowed({
+        signal,
+        onPage: ({ count, total }) =>
+          this.onProgress({
+            type: 'progress',
+            state: 'previewing',
+            phase: 'remote_followed',
+            completed: count,
+            total,
+          }),
+      });
+      const followedPids = new Set(followed.items.map((hole) => String(hole.pid)));
+      const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
+      const newPids = [...unique].filter((pid) => !followedPids.has(pid));
+      return {
+        archives,
+        allPids: [...unique],
+        newPids,
+        alreadyFollowed,
+        duplicateCount,
+        invalidFiles,
+        remoteComplete: followed.complete,
+      };
+    } finally {
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      if (this.controller === controller) this.controller = null;
     }
-    if (unique.size > LIMITS.maxImportPids) {
-      throw new AppError(ERROR_CODES.INVALID_INPUT, '导入 PID 数量超过 20000');
-    }
-    const followed = await this.api.getAllFollowed({ signal });
-    const followedPids = new Set(followed.items.map((hole) => String(hole.pid)));
-    const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
-    const newPids = [...unique].filter((pid) => !followedPids.has(pid));
-    return {
-      archives,
-      allPids: [...unique],
-      newPids,
-      alreadyFollowed,
-      duplicateCount,
-      invalidFiles,
-      remoteComplete: followed.complete,
-    };
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {

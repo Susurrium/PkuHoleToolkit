@@ -1,4 +1,4 @@
-export const APP_VERSION = '1.3.0-beta.3';
+export const APP_VERSION = '1.3.0-beta.4';
 export const API_ORIGIN = 'https://treehole.pku.edu.cn';
 export const API_BASE = `${API_ORIGIN}/api`;
 export const JOB_DB_NAME = 'pku-hole-tool';

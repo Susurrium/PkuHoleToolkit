@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞归档与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.3.0-beta.3
+// @version      1.3.0-beta.4
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -19,7 +19,7 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.3.0-beta.3';
+const APP_VERSION = '1.3.0-beta.4';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';
@@ -1567,45 +1567,74 @@ class ImportJob {
     this.controller?.abort('cancelled');
   }
 
-  async preview(files, { signal } = {}) {
+  async preview(files, { signal: externalSignal } = {}) {
+    const controller = new AbortController();
+    const onExternalAbort = () => controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    this.controller = controller;
+    const signal = controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
+    const inputFiles = [...(files || [])];
     const unique = new Set();
     let duplicateCount = 0;
     const invalidFiles = [];
     const archives = [];
-    for (const file of files || []) {
-      throwIfAborted(signal, 'import_preview');
-      try {
-        const archive = await parseArchiveFile(file);
-        archives.push({ name: file.name, format: archive.format });
-        for (const item of archive.data.items) {
-          try {
-            const pid = normalizePid(item.pid);
-            if (unique.has(pid)) duplicateCount += 1;
-            unique.add(pid);
-          } catch (error) {
-            invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+    try {
+      for (const [index, file] of inputFiles.entries()) {
+        throwIfAborted(signal, 'import_preview');
+        try {
+          const archive = await parseArchiveFile(file);
+          archives.push({ name: file.name, format: archive.format });
+          for (const item of archive.data.items) {
+            try {
+              const pid = normalizePid(item.pid);
+              if (unique.has(pid)) duplicateCount += 1;
+              unique.add(pid);
+            } catch (error) {
+              invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+            }
           }
+        } catch (error) {
+          invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
         }
-      } catch (error) {
-        invalidFiles.push({ file: file.name, error: toErrorRecord(error) });
+        this.onProgress({
+          type: 'progress',
+          state: 'previewing',
+          phase: 'archive_files',
+          completed: index + 1,
+          total: inputFiles.length,
+        });
       }
+      if (unique.size > LIMITS.maxImportPids) {
+        throw new AppError(ERROR_CODES.INVALID_INPUT, '导入 PID 数量超过 20000');
+      }
+      const followed = await this.api.getAllFollowed({
+        signal,
+        onPage: ({ count, total }) =>
+          this.onProgress({
+            type: 'progress',
+            state: 'previewing',
+            phase: 'remote_followed',
+            completed: count,
+            total,
+          }),
+      });
+      const followedPids = new Set(followed.items.map((hole) => String(hole.pid)));
+      const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
+      const newPids = [...unique].filter((pid) => !followedPids.has(pid));
+      return {
+        archives,
+        allPids: [...unique],
+        newPids,
+        alreadyFollowed,
+        duplicateCount,
+        invalidFiles,
+        remoteComplete: followed.complete,
+      };
+    } finally {
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      if (this.controller === controller) this.controller = null;
     }
-    if (unique.size > LIMITS.maxImportPids) {
-      throw new AppError(ERROR_CODES.INVALID_INPUT, '导入 PID 数量超过 20000');
-    }
-    const followed = await this.api.getAllFollowed({ signal });
-    const followedPids = new Set(followed.items.map((hole) => String(hole.pid)));
-    const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
-    const newPids = [...unique].filter((pid) => !followedPids.has(pid));
-    return {
-      archives,
-      allPids: [...unique],
-      newPids,
-      alreadyFollowed,
-      duplicateCount,
-      invalidFiles,
-      remoteComplete: followed.complete,
-    };
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {
@@ -1933,7 +1962,8 @@ function mountToolkit({
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
     $('[data-action="preview-import"]').disabled = running;
-    importExecuteButton.disabled = running || !importPreview;
+    importExecuteButton.disabled =
+      running || !importPreview || importPreview.newPids?.length === 0;
   }
 
   function handleProgress(event) {
@@ -1944,6 +1974,11 @@ function mountToolkit({
     countLabel.textContent = `${completed} / ${total || '?'}`;
     if (event.state) statusLabel.textContent = event.state;
     if (event.pid) setMessage(`正在处理 #${event.pid}（${event.phase || ''}）`);
+    else if (event.phase === 'archive_files') {
+      setMessage(`正在解析归档文件：${completed} / ${total || '?'}…`);
+    } else if (event.phase === 'remote_followed') {
+      setMessage(`正在读取当前关注：${completed} / ${total || '?'}…`);
+    }
   }
 
   async function ensureBookmarks() {
@@ -2069,6 +2104,10 @@ function mountToolkit({
     const files = [...$('#archive-files').files];
     if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
     setRunning(true);
+    statusLabel.textContent = 'previewing';
+    countLabel.textContent = '0 / ?';
+    progress.removeAttribute('value');
+    setMessage('正在解析归档并读取当前关注列表；关注较多时可能需要几十秒…');
     try {
       const credentials = await credentialsProvider();
       activeKind = 'import';
@@ -2089,7 +2128,15 @@ function mountToolkit({
         `重复：${importPreview.duplicateCount}`,
         `无效文件/记录：${importPreview.invalidFiles.length}`,
       ].join('\n');
-      setMessage('预检完成。请核对数量后确认导入。');
+      statusLabel.textContent = 'previewed';
+      progress.max = 1;
+      progress.value = 1;
+      countLabel.textContent = `${importPreview.allPids.length} PID`;
+      setMessage(
+        importPreview.newPids.length
+          ? '预检完成。请核对数量后确认导入。'
+          : '预检完成：所有 PID 均已关注，无需执行导入。',
+      );
     } finally {
       activeJob = null;
       setRunning(false);
@@ -2181,7 +2228,10 @@ function mountToolkit({
     runExport(lastExportOptions);
   });
   $('[data-action="preview-import"]').addEventListener('click', () =>
-    previewImport().catch((error) => setMessage(error.message, true)),
+    previewImport().catch((error) => {
+      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setMessage(error.message, true);
+    }),
   );
   importExecuteButton.addEventListener('click', () => executeImport());
   pauseButton.addEventListener('click', () => {

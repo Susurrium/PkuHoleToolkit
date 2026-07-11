@@ -98,9 +98,11 @@ test('import preview deduplicates legacy files and execute records an audit', as
     },
   };
   const followed = [];
+  const previewProgress = [];
   const api = {
     scheduler: { resetRateLimitCount() {} },
-    async getAllFollowed() {
+    async getAllFollowed({ onPage }) {
+      onPage({ page: 1, count: 1, total: 1 });
       return { complete: true, items: [{ pid: 123456 }] };
     },
     async followHole(pid) {
@@ -109,8 +111,15 @@ test('import preview deduplicates legacy files and execute records an audit', as
     },
   };
   const store = new MemoryJobStore();
-  const job = new ImportJob({ api, store, accountFingerprint: 'fingerprint' });
+  const job = new ImportJob({
+    api,
+    store,
+    accountFingerprint: 'fingerprint',
+    onProgress: (event) => previewProgress.push(event),
+  });
   const preview = await job.preview([file]);
+  assert.ok(previewProgress.some((event) => event.phase === 'archive_files'));
+  assert.ok(previewProgress.some((event) => event.phase === 'remote_followed'));
   assert.deepEqual(preview.newPids, ['234567']);
   assert.equal(preview.alreadyFollowed.length, 1);
   const result = await job.execute(preview);

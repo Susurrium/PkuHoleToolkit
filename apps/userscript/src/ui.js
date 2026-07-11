@@ -199,7 +199,8 @@ export function mountToolkit({
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
     $('[data-action="preview-import"]').disabled = running;
-    importExecuteButton.disabled = running || !importPreview;
+    importExecuteButton.disabled =
+      running || !importPreview || importPreview.newPids?.length === 0;
   }
 
   function handleProgress(event) {
@@ -210,6 +211,11 @@ export function mountToolkit({
     countLabel.textContent = `${completed} / ${total || '?'}`;
     if (event.state) statusLabel.textContent = event.state;
     if (event.pid) setMessage(`正在处理 #${event.pid}（${event.phase || ''}）`);
+    else if (event.phase === 'archive_files') {
+      setMessage(`正在解析归档文件：${completed} / ${total || '?'}…`);
+    } else if (event.phase === 'remote_followed') {
+      setMessage(`正在读取当前关注：${completed} / ${total || '?'}…`);
+    }
   }
 
   async function ensureBookmarks() {
@@ -335,6 +341,10 @@ export function mountToolkit({
     const files = [...$('#archive-files').files];
     if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
     setRunning(true);
+    statusLabel.textContent = 'previewing';
+    countLabel.textContent = '0 / ?';
+    progress.removeAttribute('value');
+    setMessage('正在解析归档并读取当前关注列表；关注较多时可能需要几十秒…');
     try {
       const credentials = await credentialsProvider();
       activeKind = 'import';
@@ -355,7 +365,15 @@ export function mountToolkit({
         `重复：${importPreview.duplicateCount}`,
         `无效文件/记录：${importPreview.invalidFiles.length}`,
       ].join('\n');
-      setMessage('预检完成。请核对数量后确认导入。');
+      statusLabel.textContent = 'previewed';
+      progress.max = 1;
+      progress.value = 1;
+      countLabel.textContent = `${importPreview.allPids.length} PID`;
+      setMessage(
+        importPreview.newPids.length
+          ? '预检完成。请核对数量后确认导入。'
+          : '预检完成：所有 PID 均已关注，无需执行导入。',
+      );
     } finally {
       activeJob = null;
       setRunning(false);
@@ -447,7 +465,10 @@ export function mountToolkit({
     runExport(lastExportOptions);
   });
   $('[data-action="preview-import"]').addEventListener('click', () =>
-    previewImport().catch((error) => setMessage(error.message, true)),
+    previewImport().catch((error) => {
+      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setMessage(error.message, true);
+    }),
   );
   importExecuteButton.addEventListener('click', () => executeImport());
   pauseButton.addEventListener('click', () => {
