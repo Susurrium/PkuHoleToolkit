@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞归档与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.3.0-beta.2
+// @version      1.3.0-beta.3
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -19,7 +19,7 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.3.0-beta.2';
+const APP_VERSION = '1.3.0-beta.3';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';
@@ -28,6 +28,7 @@ const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const PID_PATTERN = /^\d{5,7}$/;
 const REFERENCE_PATTERN = /#(\d{5,7})\b/g;
+const LEADING_REFERENCE_PATTERN = /^(\d{5,7})(?=\s)/;
 
 const REQUEST_POLICY = Object.freeze({
   readIntervalMs: 600,
@@ -1184,7 +1185,10 @@ function createRunId(now = new Date()) {
 function referencesFromText(text) {
   const pids = [];
   if (!text) return pids;
-  for (const match of String(text).matchAll(REFERENCE_PATTERN)) pids.push(match[1]);
+  const value = String(text);
+  const leadingReference = value.match(LEADING_REFERENCE_PATTERN);
+  if (leadingReference) pids.push(leadingReference[1]);
+  for (const match of value.matchAll(REFERENCE_PATTERN)) pids.push(match[1]);
   return pids;
 }
 

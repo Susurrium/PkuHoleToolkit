@@ -1,4 +1,9 @@
-import { JOB_STATES, LIMITS, REFERENCE_PATTERN } from './config.js';
+import {
+  JOB_STATES,
+  LEADING_REFERENCE_PATTERN,
+  LIMITS,
+  REFERENCE_PATTERN,
+} from './config.js';
 import { createArchive, createManifest, sanitizeForArchive } from './archive.js';
 import { AppError, ERROR_CODES, isAppError, toErrorRecord, throwIfAborted } from './errors.js';
 import { normalizePid } from './api.js';
@@ -9,10 +14,13 @@ function createRunId(now = new Date()) {
   return `${timestamp}-${suffix}`;
 }
 
-function referencesFromText(text) {
+export function referencesFromText(text) {
   const pids = [];
   if (!text) return pids;
-  for (const match of String(text).matchAll(REFERENCE_PATTERN)) pids.push(match[1]);
+  const value = String(text);
+  const leadingReference = value.match(LEADING_REFERENCE_PATTERN);
+  if (leadingReference) pids.push(leadingReference[1]);
+  for (const match of value.matchAll(REFERENCE_PATTERN)) pids.push(match[1]);
   return pids;
 }
 

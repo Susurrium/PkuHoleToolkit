@@ -1,4 +1,4 @@
-export const APP_VERSION = '1.3.0-beta.2';
+export const APP_VERSION = '1.3.0-beta.3';
 export const API_ORIGIN = 'https://treehole.pku.edu.cn';
 export const API_BASE = `${API_ORIGIN}/api`;
 export const JOB_DB_NAME = 'pku-hole-tool';
@@ -7,6 +7,7 @@ export const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const PID_PATTERN = /^\d{5,7}$/;
 export const REFERENCE_PATTERN = /#(\d{5,7})\b/g;
+export const LEADING_REFERENCE_PATTERN = /^(\d{5,7})(?=\s)/;
 
 export const REQUEST_POLICY = Object.freeze({
   readIntervalMs: 600,

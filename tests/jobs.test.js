@@ -1,10 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ExportJob } from '../apps/userscript/src/export-job.js';
+import { ExportJob, referencesFromText } from '../apps/userscript/src/export-job.js';
 import { ImportJob } from '../apps/userscript/src/import-job.js';
 import { MemoryJobStore } from '../apps/userscript/src/storage.js';
 import { parseArchiveBytes } from '../apps/userscript/src/archive.js';
+
+test('reference parser supports hash references and API-normalized leading PIDs', () => {
+  assert.deepEqual(referencesFromText('#8395001 body'), ['8395001']);
+  assert.deepEqual(referencesFromText('8395002 normalized body'), ['8395002']);
+  assert.deepEqual(referencesFromText('ordinary text with 8395003 in the middle'), []);
+});
 
 test('export job skips comments for zero replies and produces a complete archive', async () => {
   let commentCalls = 0;

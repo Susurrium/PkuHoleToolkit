@@ -13,7 +13,7 @@
 
 ## 安装
 
-当前公开测试版本为 `v1.3.0-beta.2`。测试者可从 [GitHub Pre-release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.3.0-beta.2) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。`beta.1` 存在入口观察器自触发导致页面白屏的问题，已经撤回。
+当前公开测试版本为 `v1.3.0-beta.3`。测试者可从 [GitHub Pre-release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.3.0-beta.3) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。`beta.1` 存在入口观察器自触发导致页面白屏的问题，已经撤回。
 
 1. 安装 Tampermonkey 或 Violentmonkey。
 2. 打开根目录生成文件 `PKU-Hole export tool.user.js` 并安装。
