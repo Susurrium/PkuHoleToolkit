@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞归档与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.3.0
+// @version      1.3.0-beta.1
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
@@ -19,7 +19,7 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.0-beta.1';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';

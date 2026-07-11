@@ -13,6 +13,8 @@
 
 ## 安装
 
+当前公开测试版本为 `v1.3.0-beta.1`。测试者可从 [GitHub Pre-release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.3.0-beta.1) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。
+
 1. 安装 Tampermonkey 或 Violentmonkey。
 2. 打开根目录生成文件 `PKU-Hole export tool.user.js` 并安装。
 3. 登录 `https://treehole.pku.edu.cn/web/`，工具会在搜索按钮附近显示“归档/迁移”。
