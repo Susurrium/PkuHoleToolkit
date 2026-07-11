@@ -53,15 +53,23 @@
 
 ## D. 归档安全检查
 
-对每个导出文件运行：
+对 B1、B2 导出文件运行：
 
 ```powershell
 npm run inspect:archive -- "<下载文件路径>" --expected=4
 ```
 
+对可能包含额外引用洞的 B3 文件运行：
+
+```powershell
+npm run inspect:archive -- "<下载文件路径>" --expected-followed=4
+```
+
 - [ ] 输出 `valid: true`
-- [ ] 输出 `uniquePids: 4`
+- [ ] B1、B2 输出 `uniquePids: 4`
+- [ ] B3 输出 `sourceCounts.followed: 4`，引用洞单独计入 `sourceCounts.referenced`
 - [ ] 输出 `sensitiveKeyCount: 0`
+- [ ] manifest 不包含可跨归档关联账号的 `accountFingerprint`
 - [ ] 不在终端、Issue 或测试记录中粘贴洞正文、评论、token、Cookie 或 UUID
 
 ## E. 导入预览
@@ -69,6 +77,13 @@ npm run inspect:archive -- "<下载文件路径>" --expected=4
 - [ ] 选择刚导出的 ZIP，只进入预览
 - [ ] 预览数量正确，重复 PID 已去重
 - [ ] 在最终确认前退出，不发送关注 POST
+
+## F. 请求与本地存储
+
+- [ ] Network 中只出现树洞同源 GET，没有关注 POST
+- [ ] 请求串行执行，没有同一 PID 的非预期重复请求
+- [ ] 分组请求使用“测试组”对应的 `bookmark_id`
+- [ ] IndexedDB 的任务记录可以包含账号指纹用于本机隔离，但不包含 token、Cookie 或原始 UUID
 
 ## 通过标准
 

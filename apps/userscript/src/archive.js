@@ -2,7 +2,7 @@ import { APP_VERSION, LIMITS, PID_PATTERN } from './config.js';
 import { AppError, ERROR_CODES } from './errors.js';
 import { createZip, readZip } from './zip.js';
 
-const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid/i;
+const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid|accountFingerprint/i;
 
 export function sanitizeForArchive(value, seen = new WeakSet()) {
   if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
@@ -104,7 +104,6 @@ export function buildReadableText(items) {
 
 export function createManifest({
   runId,
-  accountFingerprint,
   scope,
   complete,
   items,
@@ -120,7 +119,6 @@ export function createManifest({
     toolVersion: APP_VERSION,
     runId,
     exportedAt,
-    accountFingerprint,
     scope: sanitizeForArchive(scope),
     complete: Boolean(complete),
     counts: {

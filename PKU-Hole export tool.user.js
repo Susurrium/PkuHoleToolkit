@@ -809,7 +809,7 @@ function readZip(input, { maxUncompressedBytes = Infinity } = {}) {
 
 
 // ---- archive.js ----
-const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid/i;
+const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid|accountFingerprint/i;
 
 function sanitizeForArchive(value, seen = new WeakSet()) {
   if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
@@ -911,7 +911,6 @@ function buildReadableText(items) {
 
 function createManifest({
   runId,
-  accountFingerprint,
   scope,
   complete,
   items,
@@ -927,7 +926,6 @@ function createManifest({
     toolVersion: APP_VERSION,
     runId,
     exportedAt,
-    accountFingerprint,
     scope: sanitizeForArchive(scope),
     complete: Boolean(complete),
     counts: {
@@ -1505,7 +1503,6 @@ class ExportJob {
       const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');
       const manifest = createManifest({
         runId: job.id,
-        accountFingerprint: this.accountFingerprint,
         scope: options,
         complete,
         items,

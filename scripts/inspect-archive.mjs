@@ -5,13 +5,25 @@ import { parseArchiveBytes } from '../apps/userscript/src/archive.js';
 
 const archivePath = process.argv[2];
 const expectedArgument = process.argv.find((argument) => argument.startsWith('--expected='));
+const expectedFollowedArgument = process.argv.find((argument) =>
+  argument.startsWith('--expected-followed='),
+);
 const expectedHoles = expectedArgument ? Number(expectedArgument.slice('--expected='.length)) : null;
+const expectedFollowed = expectedFollowedArgument
+  ? Number(expectedFollowedArgument.slice('--expected-followed='.length))
+  : null;
 
 if (!archivePath) {
-  console.error('Usage: npm run inspect:archive -- <archive> [--expected=<count>]');
+  console.error(
+    'Usage: npm run inspect:archive -- <archive> [--expected=<count>] [--expected-followed=<count>]',
+  );
   process.exitCode = 2;
-} else if (expectedHoles !== null && (!Number.isInteger(expectedHoles) || expectedHoles < 0)) {
-  console.error('--expected must be a non-negative integer');
+} else if (
+  [expectedHoles, expectedFollowed].some(
+    (value) => value !== null && (!Number.isInteger(value) || value < 0),
+  )
+) {
+  console.error('--expected and --expected-followed must be non-negative integers');
   process.exitCode = 2;
 } else {
   const bytes = new Uint8Array(await readFile(resolve(archivePath)));
@@ -20,8 +32,12 @@ if (!archivePath) {
   const manifestCounts = archive.manifest.counts || {};
   const commentCount = items.reduce((total, item) => total + item.comments.length, 0);
   const uniquePids = new Set(items.map((item) => String(item.pid)));
+  const sourceCounts = items.reduce((counts, item) => {
+    counts[item.source] = (counts[item.source] || 0) + 1;
+    return counts;
+  }, {});
   const sensitivePaths = [];
-  const sensitiveKeyPattern = /token|authorization|cookie|uuid/i;
+  const sensitiveKeyPattern = /token|authorization|cookie|uuid|accountFingerprint/i;
 
   const scan = (value, path = '$', seen = new WeakSet()) => {
     if (!value || typeof value !== 'object' || seen.has(value)) return;
@@ -46,6 +62,11 @@ if (!archivePath) {
   if (expectedHoles !== null && items.length !== expectedHoles) {
     errors.push(`expected ${expectedHoles} holes but found ${items.length}`);
   }
+  if (expectedFollowed !== null && (sourceCounts.followed || 0) !== expectedFollowed) {
+    errors.push(
+      `expected ${expectedFollowed} followed holes but found ${sourceCounts.followed || 0}`,
+    );
+  }
   if (sensitivePaths.length) errors.push('archive contains sensitive-looking keys');
 
   console.log(
@@ -61,6 +82,7 @@ if (!archivePath) {
         comments: commentCount,
         failed: manifestCounts.failed ?? archive.manifest.errors?.length ?? 0,
         uniquePids: uniquePids.size,
+        sourceCounts,
         sensitiveKeyCount: sensitivePaths.length,
         errors,
       },

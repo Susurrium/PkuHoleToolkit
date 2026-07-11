@@ -22,7 +22,6 @@
         "toolVersion": { "type": "string" },
         "runId": { "type": "string" },
         "exportedAt": { "type": "string", "format": "date-time" },
-        "accountFingerprint": { "type": "string" },
         "scope": { "type": "object" },
         "complete": { "type": "boolean" },
         "counts": { "type": "object" },

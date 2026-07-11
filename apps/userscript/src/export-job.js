@@ -331,7 +331,6 @@ export class ExportJob {
       const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');
       const manifest = createManifest({
         runId: job.id,
-        accountFingerprint: this.accountFingerprint,
         scope: options,
         complete,
         items,

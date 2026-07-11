@@ -32,7 +32,6 @@ test('archive v2 has manifest, data and readable files without credentials', () 
   ];
   const manifest = createManifest({
     runId: 'run-1',
-    accountFingerprint: 'fingerprint',
     scope: { type: 'all' },
     complete: true,
     items,
@@ -44,6 +43,7 @@ test('archive v2 has manifest, data and readable files without credentials', () 
   assert.equal(parsed.format, 'v2');
   assert.equal(parsed.data.items[0].hole.token, undefined);
   assert.equal(parsed.data.items[0].comments[0].uuid, undefined);
+  assert.equal(parsed.manifest.accountFingerprint, undefined);
   assert.equal(parsed.manifest.counts.exportedHoles, 1);
   assert.ok(readZip(archive.bytes)['readable.txt']);
 });
@@ -61,10 +61,18 @@ test('legacy v1 comments are flattened and attached by index', () => {
 });
 
 test('sensitive keys are removed recursively', () => {
-  assert.deepEqual(sanitizeForArchive({ a: 1, authToken: 'x', nested: { uuid: 'y', b: 2 } }), {
-    a: 1,
-    nested: { b: 2 },
-  });
+  assert.deepEqual(
+    sanitizeForArchive({
+      a: 1,
+      authToken: 'x',
+      accountFingerprint: 'stable-linking-id',
+      nested: { uuid: 'y', b: 2 },
+    }),
+    {
+      a: 1,
+      nested: { b: 2 },
+    },
+  );
 });
 
 test('invalid archive is rejected', () => {
