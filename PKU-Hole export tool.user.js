@@ -7,7 +7,8 @@
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // @run-at       document-end
 // @homepageURL  https://github.com/Susurrium/PkuHoleToolkit
 // @supportURL   https://github.com/Susurrium/PkuHoleToolkit/issues
@@ -1010,6 +1011,60 @@ async function parseArchiveFile(file) {
 }
 
 
+// ---- studio-bridge.js ----
+function parseStudioPairingCode(value) {
+  const match = String(value || '').trim().match(/^(\d{1,5}):([a-f0-9]{32})$/i);
+  if (!match) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '配对码格式不正确，请从 Studio 归档导入页重新复制');
+  }
+  const port = Number(match[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '配对码中的端口无效');
+  }
+  return { port, token: match[2].toLowerCase() };
+}
+
+function sendArchiveToStudio(code, archive, request = globalThis.GM_xmlhttpRequest) {
+  const { port, token } = parseStudioPairingCode(code);
+  if (!archive?.blob || !archive?.filename) {
+    return Promise.reject(new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出'));
+  }
+  if (typeof request !== 'function') {
+    return Promise.reject(new AppError(ERROR_CODES.NETWORK, '当前用户脚本管理器不支持本地桥接请求，请更新脚本后重试'));
+  }
+  const body = new FormData();
+  body.append('file', archive.blob, archive.filename);
+  return new Promise((resolve, reject) => {
+    request({
+      method: 'POST',
+      url: `http://127.0.0.1:${port}/api/v1/bridge/pairings/${token}/archive`,
+      data: body,
+      timeout: 120_000,
+      onload(response) {
+        let decoded;
+        try {
+          decoded = JSON.parse(response.responseText || '{}');
+        } catch {
+          reject(new AppError(ERROR_CODES.NETWORK, 'Studio 返回了无法识别的响应'));
+          return;
+        }
+        if (response.status < 200 || response.status >= 300) {
+          reject(new AppError(ERROR_CODES.INVALID_INPUT, decoded?.error?.message || `Studio 拒绝了归档 (${response.status})`));
+          return;
+        }
+        resolve(decoded.data);
+      },
+      ontimeout() {
+        reject(new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
+      },
+      onerror() {
+        reject(new AppError(ERROR_CODES.NETWORK, '无法连接 Studio，请确认程序、端口和配对码均正确'));
+      },
+    });
+  });
+}
+
+
 // ---- storage.js ----
 function cloneValue(value) {
   if (value === undefined) return undefined;
@@ -1865,6 +1920,12 @@ function panelTemplate() {
             </div>
             <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>包含 readable.txt</label></div>
             <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
+            <div class="status-card">
+              <h3>发送到 PkuHoleStudio</h3>
+              <p class="message">先完成上方导出，再粘贴 Studio“归档导入”页生成的一次性配对码。这里只发送归档，不发送登录信息。</p>
+              <div class="field"><label for="studio-pairing-code">一次性配对码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+              <div class="actions"><button type="button" data-action="send-studio" disabled>发送刚导出的归档</button></div>
+            </div>
           </section>
           <section data-panel="import" hidden>
             <h3>导入关注</h3>
@@ -1919,6 +1980,7 @@ function mountToolkit({
   let activeJobId = null;
   let lastExportOptions = null;
   let importPreview = null;
+  let lastArchive = null;
   let bookmarksLoaded = false;
   const mountedAt = Date.now();
 
@@ -1979,6 +2041,7 @@ function mountToolkit({
     resumeButton.disabled = running || !activeJobId;
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
+    $('[data-action="send-studio"]').disabled = running || !lastArchive;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
       running ||
@@ -2105,6 +2168,7 @@ function mountToolkit({
         setMessage('任务已暂停，可稍后继续。');
         return;
       }
+      lastArchive = result.archive;
       downloadBlob(documentObject, result.archive.blob, result.archive.filename);
       statusLabel.textContent = result.job.state;
       countLabel.textContent = `${result.manifest.counts.exportedHoles} / ${result.manifest.counts.expectedHoles ?? '?'}`;
@@ -2217,6 +2281,26 @@ function mountToolkit({
     }
   }
 
+  async function sendToStudio() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+    const code = $('#studio-pairing-code').value.trim();
+    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性配对码');
+    setRunning(true);
+    statusLabel.textContent = 'sending';
+    setMessage('正在把归档发送到本机 Studio…');
+    try {
+      const result = await sendArchiveToStudio(code, lastArchive);
+      statusLabel.textContent = 'awaiting_confirmation';
+      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+      $('#studio-pairing-code').value = '';
+    } catch (error) {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
   function openPanel() {
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
@@ -2255,6 +2339,12 @@ function mountToolkit({
     lastExportOptions = exportOptions();
     runExport(lastExportOptions);
   });
+  $('[data-action="send-studio"]').addEventListener('click', () =>
+    sendToStudio().catch((error) => {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    }),
+  );
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';

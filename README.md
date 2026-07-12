@@ -7,6 +7,7 @@
 - 从当前登录账号导出全部关注、指定收藏分组、指定 PID 或日期范围。
 - 可选择正文、评论以及正文/评论中的一层 `#PID` 引用。
 - 默认生成一个 `.treehole.zip`，包含 `manifest.json`、`data.json` 和可选的 `readable.txt`。
+- 可把刚导出的归档通过 5 分钟有效的一次性配对码直接发送到本机 PkuHoleStudio，并在 Studio 中二次确认导入。
 - 支持暂停、取消、七天内恢复，以及只重试未完整项目。
 - 支持导入新版 ZIP 和旧版 `{ holes, comments }` JSON；关注前会预检、去重和二次确认。仅归档的 `referenced` 上下文不会被关注。
 - 所有账号写请求只发送一次，响应不确定时通过读取接口核对最终状态。
@@ -23,7 +24,7 @@
 
 ## 安全与隐私
 
-- 脚本只请求 `https://treehole.pku.edu.cn/api/*`，不上传导出内容。
+- 树洞数据请求仅访问 `https://treehole.pku.edu.cn/api/*`。用户主动使用 Studio 配对时，脚本会把刚导出的 ZIP 发送到配对码指定的本机 `http://127.0.0.1:<端口>`；不会发送账号、Cookie、token 或 UUID。
 - token、Cookie 和原始 UUID 不写入 IndexedDB 或归档；仅在 IndexedDB 任务记录中保存不可逆账号指纹，用于阻止跨账号恢复断点。
 - 账号指纹不会写入 ZIP，避免不同归档被关联为同一账号。
 - 归档包含用户关注内容和评论，可能十分敏感；请勿随意上传到第三方网站或公共云盘。

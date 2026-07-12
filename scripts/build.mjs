@@ -14,7 +14,8 @@ const metadata = `// ==UserScript==
 // @license      MIT
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
 // @run-at       document-end
 // @homepageURL  https://github.com/Susurrium/PkuHoleToolkit
 // @supportURL   https://github.com/Susurrium/PkuHoleToolkit/issues
@@ -31,6 +32,7 @@ const modules = [
   'api.js',
   'zip.js',
   'archive.js',
+  'studio-bridge.js',
   'storage.js',
   'export-job.js',
   'import-job.js',

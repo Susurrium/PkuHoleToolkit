@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 增加 PkuHoleStudio 本地桥接：完成导出后可使用 Studio 生成的一次性配对码发送 archive v2。
+- 桥接只向 `127.0.0.1` 发送归档文件，不发送树洞账号、Cookie、token 或 UUID。
+
 ## 1.3.0 - 2026-07-12
 
 - 完成收藏分组、评论、一层组外引用、无评论归档和只读导入预检的真实环境验收。

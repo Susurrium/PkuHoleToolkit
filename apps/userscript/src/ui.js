@@ -1,6 +1,7 @@
 import { ExportJob } from './export-job.js';
 import { ImportJob, buildImportAuditText } from './import-job.js';
 import { AppError, ERROR_CODES, toErrorRecord } from './errors.js';
+import { sendArchiveToStudio } from './studio-bridge.js';
 
 const ENTRY_ID = 'pku-hole-toolkit-entry';
 const HOST_ID = 'pku-hole-toolkit-host';
@@ -84,6 +85,12 @@ function panelTemplate() {
             </div>
             <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>包含 readable.txt</label></div>
             <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
+            <div class="status-card">
+              <h3>发送到 PkuHoleStudio</h3>
+              <p class="message">先完成上方导出，再粘贴 Studio“归档导入”页生成的一次性配对码。这里只发送归档，不发送登录信息。</p>
+              <div class="field"><label for="studio-pairing-code">一次性配对码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+              <div class="actions"><button type="button" data-action="send-studio" disabled>发送刚导出的归档</button></div>
+            </div>
           </section>
           <section data-panel="import" hidden>
             <h3>导入关注</h3>
@@ -138,6 +145,7 @@ export function mountToolkit({
   let activeJobId = null;
   let lastExportOptions = null;
   let importPreview = null;
+  let lastArchive = null;
   let bookmarksLoaded = false;
   const mountedAt = Date.now();
 
@@ -198,6 +206,7 @@ export function mountToolkit({
     resumeButton.disabled = running || !activeJobId;
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
+    $('[data-action="send-studio"]').disabled = running || !lastArchive;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
       running ||
@@ -324,6 +333,7 @@ export function mountToolkit({
         setMessage('任务已暂停，可稍后继续。');
         return;
       }
+      lastArchive = result.archive;
       downloadBlob(documentObject, result.archive.blob, result.archive.filename);
       statusLabel.textContent = result.job.state;
       countLabel.textContent = `${result.manifest.counts.exportedHoles} / ${result.manifest.counts.expectedHoles ?? '?'}`;
@@ -436,6 +446,26 @@ export function mountToolkit({
     }
   }
 
+  async function sendToStudio() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+    const code = $('#studio-pairing-code').value.trim();
+    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性配对码');
+    setRunning(true);
+    statusLabel.textContent = 'sending';
+    setMessage('正在把归档发送到本机 Studio…');
+    try {
+      const result = await sendArchiveToStudio(code, lastArchive);
+      statusLabel.textContent = 'awaiting_confirmation';
+      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+      $('#studio-pairing-code').value = '';
+    } catch (error) {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
   function openPanel() {
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
@@ -474,6 +504,12 @@ export function mountToolkit({
     lastExportOptions = exportOptions();
     runExport(lastExportOptions);
   });
+  $('[data-action="send-studio"]').addEventListener('click', () =>
+    sendToStudio().catch((error) => {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    }),
+  );
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
