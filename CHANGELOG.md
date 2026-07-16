@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-- 增加 PkuHoleStudio 本地桥接：完成导出后可使用 Studio 生成的一次性配对码发送 archive v2。
+- archive v2 接入中立的 PkuHole Archive Contract 2.1.0：新归档携带 `specVersion`、`producer` 和直接可移植的 scope；旧 v2 继续兼容。
+- Toolkit 使用与 Studio 相同的有效/无效 fixtures 执行契约测试，并拒绝无效时间、错误记录形状和未知必需扩展。
+- 向 Studio 发送前会读取其原生归档能力，核对 schema、必需扩展和文件大小；不兼容时在签名和上传前终止。
+- 能力结果按 Studio 实例缓存五分钟；新增双方真实导出 ZIP 的互操作测试，并将 Archive 2.1 的 ZIP 写入时间统一为 UTC、压缩方法固定为 STORE。
+- PkuHoleStudio 本地桥接升级为“一次关联、可撤销信任”：设备私钥仅保存在用户脚本私有存储，Studio 只保存公钥；每次归档仍使用短时、一次性且绑定 SHA-256 的签名传输票据。
+- Toolkit 刷新后可从 IndexedDB 恢复最近完成或部分完成的导出，直接重发到已关联 Studio 或重新下载，不必重新抓取树洞。
+- Studio 收到归档后仍先预检、再由用户确认导入；旧版一次性接收码保留为兼容入口，等待上传 15 分钟、确认窗口 30 分钟。
 - 桥接只向 `127.0.0.1` 发送归档文件，不发送树洞账号、Cookie、token 或 UUID。
 
 ## 1.3.0 - 2026-07-12

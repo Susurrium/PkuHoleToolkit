@@ -3,6 +3,7 @@ export const ERROR_CODES = Object.freeze({
   UNAUTHORIZED: 'unauthorized',
   RATE_LIMITED: 'rate_limited',
   NETWORK_ERROR: 'network_error',
+  TIMEOUT: 'timeout',
   INVALID_RESPONSE: 'invalid_response',
   BUSINESS_ERROR: 'business_error',
   UNKNOWN_RESULT: 'unknown_result',

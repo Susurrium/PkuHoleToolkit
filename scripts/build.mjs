@@ -15,6 +15,9 @@ const metadata = `// ==UserScript==
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      127.0.0.1
 // @run-at       document-end
 // @homepageURL  https://github.com/Susurrium/PkuHoleToolkit

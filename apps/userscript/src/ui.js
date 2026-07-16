@@ -1,7 +1,16 @@
 import { ExportJob } from './export-job.js';
 import { ImportJob, buildImportAuditText } from './import-job.js';
 import { AppError, ERROR_CODES, toErrorRecord } from './errors.js';
-import { sendArchiveToStudio } from './studio-bridge.js';
+import {
+  createStudioBridgeStorage,
+  forgetStudioDevice,
+  refreshStudioDevicePairing,
+  requestStudioDevicePairing,
+  restoreLatestExportArchive,
+  sendArchiveToStudio,
+  sendArchiveToTrustedStudio,
+  waitForStudioDevicePairing,
+} from './studio-bridge.js';
 
 const ENTRY_ID = 'pku-hole-toolkit-entry';
 const HOST_ID = 'pku-hole-toolkit-host';
@@ -87,9 +96,18 @@ function panelTemplate() {
             <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
             <div class="status-card">
               <h3>发送到 PkuHoleStudio</h3>
-              <p class="message">先完成上方导出，再粘贴 Studio“归档导入”页生成的一次性配对码。这里只发送归档，不发送登录信息。</p>
-              <div class="field"><label for="studio-pairing-code">一次性配对码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
-              <div class="actions"><button type="button" data-action="send-studio" disabled>发送刚导出的归档</button></div>
+              <p class="message" data-studio-connection>尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。</p>
+              <div class="grid">
+                <div class="field"><label for="studio-port">本机 Studio 端口</label><input id="studio-port" inputmode="numeric" value="8080"></div>
+              </div>
+              <div class="actions"><button type="button" data-action="pair-studio">关联本机 Studio</button><button type="button" data-action="refresh-studio">检查关联状态</button><button type="button" data-action="forget-studio">撤销/忘记关联</button></div>
+              <div class="actions"><button type="button" data-action="send-studio" disabled>发送到已关联 Studio</button><button type="button" data-action="download-last-export" disabled>重新下载最近归档</button></div>
+              <details>
+                <summary>兼容旧版 Toolkit：一次性接收码</summary>
+                <p class="message">请先完成导出，再到 Studio 生成 15 分钟有效的一次性接收码。</p>
+                <div class="field"><label for="studio-pairing-code">一次性接收码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+                <div class="actions"><button type="button" data-action="send-studio-legacy" disabled>使用接收码发送</button></div>
+              </details>
             </div>
           </section>
           <section data-panel="import" hidden>
@@ -146,8 +164,12 @@ export function mountToolkit({
   let lastExportOptions = null;
   let importPreview = null;
   let lastArchive = null;
+  let studioBridgeState = null;
+  let pairingWatch = null;
+  let isRunning = false;
   let bookmarksLoaded = false;
   const mountedAt = Date.now();
+  const studioBridgeStorage = createStudioBridgeStorage();
 
   if (!entry) {
     entry = documentObject.createElement('button');
@@ -167,16 +189,23 @@ export function mountToolkit({
 
   const $ = (selector) => shadow.querySelector(selector);
   const overlay = $('.overlay');
-  const statusCard = $('.status-card');
   const statusLabel = $('[data-state]');
+  const statusCard = statusLabel.closest('.status-card');
   const countLabel = $('[data-count]');
   const progress = $('progress');
-  const message = $('.message');
+  const message = statusCard.querySelector('.message');
   const pauseButton = $('[data-action="pause"]');
   const resumeButton = $('[data-action="resume"]');
   const cancelButton = $('[data-action="cancel"]');
   const retryButton = $('[data-action="retry"]');
   const importExecuteButton = $('[data-action="execute-import"]');
+  const studioConnectionMessage = $('[data-studio-connection]');
+  const studioPairButton = $('[data-action="pair-studio"]');
+  const studioRefreshButton = $('[data-action="refresh-studio"]');
+  const studioForgetButton = $('[data-action="forget-studio"]');
+  const studioSendButton = $('[data-action="send-studio"]');
+  const studioLegacySendButton = $('[data-action="send-studio-legacy"]');
+  const lastExportDownloadButton = $('[data-action="download-last-export"]');
 
   function placeEntry() {
     const anchor = documentObject.querySelector('div.search-btn');
@@ -200,19 +229,42 @@ export function mountToolkit({
   }
 
   function setRunning(running) {
+    isRunning = running;
     statusCard.setAttribute('aria-busy', String(running));
     pauseButton.disabled = !running;
     cancelButton.disabled = !running;
     resumeButton.disabled = running || !activeJobId;
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
-    $('[data-action="send-studio"]').disabled = running || !lastArchive;
+    studioSendButton.disabled = running || !lastArchive || studioBridgeState?.status !== 'paired';
+    studioLegacySendButton.disabled = running || !lastArchive;
+    lastExportDownloadButton.disabled = running || !lastArchive;
+    studioPairButton.disabled = running || studioBridgeState?.status === 'paired' || studioBridgeState?.status === 'pending';
+    studioRefreshButton.disabled = running || !studioBridgeState;
+    studioForgetButton.disabled = running || !studioBridgeState;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
       running ||
       !importPreview ||
       importPreview.remoteComplete !== true ||
       importPreview.newPids?.length === 0;
+  }
+
+  function renderStudioBridgeState() {
+    const state = studioBridgeState;
+    if (state?.status === 'paired') {
+      studioConnectionMessage.textContent = `已关联 ${state.name || 'Toolkit 设备'}，发送时会自动申请仅对当前归档有效的一次性票据。`;
+      $('#studio-port').value = String(state.port || 8080);
+      studioPairButton.textContent = 'Studio 已关联';
+    } else if (state?.status === 'pending') {
+      studioConnectionMessage.textContent = `等待 Studio 确认。请在 Studio“Toolkit 传输”页核对：${state.verificationCode || '------'}`;
+      $('#studio-port').value = String(state.port || 8080);
+      studioPairButton.textContent = '等待 Studio 确认';
+    } else {
+      studioConnectionMessage.textContent = '尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。';
+      studioPairButton.textContent = '关联本机 Studio';
+    }
+    setRunning(isRunning);
   }
 
   function handleProgress(event) {
@@ -263,6 +315,12 @@ export function mountToolkit({
   async function discoverResumableJob() {
     try {
       const credentials = await credentialsProvider();
+      const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
+      if (restored) {
+        lastArchive = restored.archive;
+        lastExportOptions = restored.job.options;
+        setRunning(false);
+      }
       const jobs = (await store.listJobs())
         .filter(
           (job) =>
@@ -271,7 +329,10 @@ export function mountToolkit({
         )
         .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
       const job = jobs[0];
-      if (!job) return;
+      if (!job) {
+        if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
+        return;
+      }
       activeJobId = job.id;
       activeKind = job.type;
       if (job.type === 'export') lastExportOptions = job.options;
@@ -446,10 +507,112 @@ export function mountToolkit({
     }
   }
 
-  async function sendToStudio() {
+  async function refreshStudioConnection() {
+    try {
+      studioBridgeState = await studioBridgeStorage.get();
+      if (studioBridgeState?.status === 'pending') {
+        studioBridgeState = await refreshStudioDevicePairing({ state: studioBridgeState, storage: studioBridgeStorage });
+      }
+    } catch (error) {
+      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) studioBridgeState = null;
+      else throw error;
+    } finally {
+      renderStudioBridgeState();
+    }
+    return studioBridgeState;
+  }
+
+  function watchStudioPairing(state) {
+    if (pairingWatch || state?.status !== 'pending') return;
+    pairingWatch = waitForStudioDevicePairing({
+      state,
+      storage: studioBridgeStorage,
+      onUpdate(next) {
+        studioBridgeState = next;
+        renderStudioBridgeState();
+      },
+    })
+      .then((paired) => {
+        studioBridgeState = paired;
+        renderStudioBridgeState();
+        statusLabel.textContent = 'studio_paired';
+        setMessage('Studio 关联成功。今后可直接发送，不再复制接收码。');
+      })
+      .catch((error) => {
+        studioBridgeState = null;
+        renderStudioBridgeState();
+        statusLabel.textContent = 'failed';
+        setMessage(error.message || 'Studio 关联失败', true);
+      })
+      .finally(() => {
+        pairingWatch = null;
+      });
+  }
+
+  async function pairStudio() {
+    const port = $('#studio-port').value.trim();
+    setRunning(true);
+    statusLabel.textContent = 'pairing_studio';
+    setMessage('正在向本机 Studio 发起关联请求…');
+    try {
+      studioBridgeState = await requestStudioDevicePairing({ port, storage: studioBridgeStorage });
+      renderStudioBridgeState();
+      const studioURL = `http://127.0.0.1:${studioBridgeState.port}/imports?view=bridge`;
+      windowObject.open?.(studioURL, '_blank', 'noopener');
+      setMessage(`关联请求已发出，请在 Studio 核对 ${studioBridgeState.verificationCode} 并确认。`);
+      watchStudioPairing(studioBridgeState);
+    } catch (error) {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '无法发起 Studio 关联', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function sendToTrustedStudio() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+    if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
+    setRunning(true);
+    statusLabel.textContent = 'sending';
+    setMessage('正在签名并把归档发送到已关联 Studio…');
+    try {
+      const result = await sendArchiveToTrustedStudio(lastArchive, { state: studioBridgeState, storage: studioBridgeStorage });
+      statusLabel.textContent = 'awaiting_confirmation';
+      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+    } catch (error) {
+      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) {
+        await studioBridgeStorage.delete();
+        studioBridgeState = null;
+        renderStudioBridgeState();
+      }
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function forgetStudioConnection() {
+    const previous = studioBridgeState;
+    setRunning(true);
+    try {
+      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
+      studioBridgeState = null;
+      renderStudioBridgeState();
+      setMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地关联请求。');
+    } catch (error) {
+      studioBridgeState = null;
+      renderStudioBridgeState();
+      setMessage(`本地关联已删除；Studio 当前不可达，稍后可在 Studio 设备列表清理。${error.message ? `（${error.message}）` : ''}`);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function sendToStudioWithCode() {
     if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
     const code = $('#studio-pairing-code').value.trim();
-    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性配对码');
+    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在把归档发送到本机 Studio…');
@@ -466,11 +629,20 @@ export function mountToolkit({
     }
   }
 
+  function downloadLastExport() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有可重新下载的完成归档');
+    downloadBlob(documentObject, lastArchive.blob, lastArchive.filename);
+    setMessage(`已重新下载 ${lastArchive.filename}`);
+  }
+
   function openPanel() {
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
     $('.close').focus();
     discoverResumableJob();
+    refreshStudioConnection()
+      .then((state) => watchStudioPairing(state))
+      .catch((error) => setMessage(error.message || '读取 Studio 关联状态失败', true));
   }
 
   function closePanel() {
@@ -505,11 +677,34 @@ export function mountToolkit({
     runExport(lastExportOptions);
   });
   $('[data-action="send-studio"]').addEventListener('click', () =>
-    sendToStudio().catch((error) => {
+    sendToTrustedStudio().catch((error) => {
       statusLabel.textContent = 'failed';
       setMessage(error.message || '发送到 Studio 失败', true);
     }),
   );
+  $('[data-action="send-studio-legacy"]').addEventListener('click', () =>
+    sendToStudioWithCode().catch((error) => {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    }),
+  );
+  studioPairButton.addEventListener('click', () => pairStudio());
+  studioForgetButton.addEventListener('click', () => forgetStudioConnection());
+  studioRefreshButton.addEventListener('click', () =>
+    refreshStudioConnection()
+      .then((state) => {
+        watchStudioPairing(state);
+        if (state?.status === 'paired') setMessage('Studio 关联有效，可以直接发送。');
+      })
+      .catch((error) => setMessage(error.message || '检查 Studio 关联失败', true)),
+  );
+  lastExportDownloadButton.addEventListener('click', () => {
+    try {
+      downloadLastExport();
+    } catch (error) {
+      setMessage(error.message, true);
+    }
+  });
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';

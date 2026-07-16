@@ -10,6 +10,7 @@
     "test": "node --test",
     "lint": "node scripts/lint.mjs",
     "format:check": "node scripts/format-check.mjs",
+    "fixture:archive-contract": "node scripts/generate-contract-fixture.mjs",
     "inspect:archive": "node scripts/inspect-archive.mjs",
     "check": "npm run lint && npm run format:check && npm run test && npm run build && node --check \"PKU-Hole export tool.user.js\""
   },

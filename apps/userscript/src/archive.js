@@ -3,6 +3,17 @@ import { AppError, ERROR_CODES } from './errors.js';
 import { createZip, readZip } from './zip.js';
 
 const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid|accountFingerprint/i;
+export const ARCHIVE_SPEC_VERSION = '2.1.0';
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validArchiveScope(value) {
+  if (!isPlainObject(value)) return false;
+  const selector = isPlainObject(value.scope) ? value.scope : value;
+  return typeof selector.type === 'string' && selector.type.length > 0;
+}
 
 export function sanitizeForArchive(value, seen = new WeakSet()) {
   if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
@@ -52,29 +63,91 @@ export function legacyArchiveToItems(value) {
 
 export function validateArchiveV2(manifest, data) {
   if (
-    !manifest ||
+    !isPlainObject(manifest) ||
     manifest.schemaVersion !== 2 ||
     typeof manifest.toolVersion !== 'string' ||
+    manifest.toolVersion.length === 0 ||
     typeof manifest.runId !== 'string' ||
+    manifest.runId.length === 0 ||
     typeof manifest.exportedAt !== 'string' ||
+    !Number.isFinite(Date.parse(manifest.exportedAt)) ||
+    !validArchiveScope(manifest.scope) ||
     typeof manifest.complete !== 'boolean' ||
-    !manifest.counts ||
-    !Array.isArray(manifest.errors)
+    !isPlainObject(manifest.counts) ||
+    !Array.isArray(manifest.errors) ||
+    (manifest.specVersion !== undefined && manifest.errors.some((error) => !isPlainObject(error)))
   ) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 manifest 不符合 v2 协议');
   }
-  if (!data || !Array.isArray(data.items)) {
+  if (manifest.specVersion !== undefined && !/^2\.\d+\.\d+$/.test(manifest.specVersion)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 specVersion 不受支持');
+  }
+  if (
+    manifest.producer !== undefined &&
+    (!isPlainObject(manifest.producer) ||
+      typeof manifest.producer.name !== 'string' ||
+      manifest.producer.name.length === 0 ||
+      (manifest.producer.version !== undefined &&
+        (typeof manifest.producer.version !== 'string' || manifest.producer.version.length === 0)))
+  ) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 producer 信息无效');
+  }
+  if (manifest.extensions !== undefined && !isPlainObject(manifest.extensions)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 extensions 信息无效');
+  }
+  for (const [name, descriptor] of Object.entries(manifest.extensions || {})) {
+    if (
+      !/^[a-z0-9]+(?:[.-][a-z0-9]+)+$/.test(name) ||
+      !isPlainObject(descriptor) ||
+      !Number.isInteger(descriptor.version) ||
+      descriptor.version < 1
+    ) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档扩展声明无效：${name}`);
+    }
+    if (descriptor.required === true) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档需要当前 Toolkit 不支持的扩展：${name}`);
+    }
+  }
+  for (const name of ['expectedHoles', 'exportedHoles', 'comments', 'failed', 'media', 'missingMedia', 'localTags', 'localNotes']) {
+    const value = manifest.counts[name];
+    if (value !== undefined && value !== null && (!Number.isInteger(value) || value < 0)) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档 counts.${name} 无效`);
+    }
+  }
+  if (manifest.requiredExtensions !== undefined) {
+    if (!Array.isArray(manifest.requiredExtensions) || manifest.requiredExtensions.some((name) => typeof name !== 'string')) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 requiredExtensions 信息无效');
+    }
+    if (manifest.requiredExtensions.length > 0) {
+      throw new AppError(
+        ERROR_CODES.INVALID_INPUT,
+        `归档需要当前 Toolkit 不支持的扩展：${manifest.requiredExtensions.join(', ')}`,
+      );
+    }
+  }
+  if (!isPlainObject(data) || Object.keys(data).some((key) => key !== 'items') || !Array.isArray(data.items)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档缺少 data.items');
+  }
+  if (data.items.length > LIMITS.maxImportPids) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `归档记录超过 ${LIMITS.maxImportPids} 条`);
   }
   const sources = new Set(['followed', 'referenced', 'explicit', 'legacy-v1']);
   for (const item of data.items) {
     if (
-      !item ||
+      !isPlainObject(item) ||
       !PID_PATTERN.test(String(item.pid)) ||
       !sources.has(item.source) ||
       !['ok', 'partial'].includes(item.fetchStatus) ||
-      !item.hole ||
-      !Array.isArray(item.comments)
+      !isPlainObject(item.hole) ||
+      String(item.hole.pid) !== String(item.pid) ||
+      !Array.isArray(item.comments) ||
+      item.comments.some(
+        (comment) =>
+          !isPlainObject(comment) ||
+          !Number.isInteger(Number(comment.cid)) ||
+          Number(comment.cid) <= 0 ||
+          (comment.pid !== undefined && String(comment.pid) !== String(item.pid)),
+      )
     ) {
       throw new AppError(ERROR_CODES.INVALID_INPUT, '归档中存在无效的洞记录');
     }
@@ -111,15 +184,26 @@ export function createManifest({
   expectedHoles = null,
   exportedAt = new Date().toISOString(),
 }) {
+  const normalizedScope = isPlainObject(scope?.scope) ? scope.scope : scope;
+  const exportOptions = isPlainObject(scope?.scope)
+    ? {
+        includeComments: scope.includeComments,
+        includeReadable: scope.includeReadable,
+        referenceMode: scope.referenceMode,
+      }
+    : undefined;
   const timestamps = items
     .map((item) => Number(item.hole?.timestamp))
     .filter((timestamp) => Number.isFinite(timestamp));
   return {
     schemaVersion: 2,
+    specVersion: ARCHIVE_SPEC_VERSION,
     toolVersion: APP_VERSION,
+    producer: { name: 'PkuHoleToolkit', version: APP_VERSION },
     runId,
     exportedAt,
-    scope: sanitizeForArchive(scope),
+    scope: sanitizeForArchive(normalizedScope),
+    ...(exportOptions ? { exportOptions: sanitizeForArchive(exportOptions) } : {}),
     complete: Boolean(complete),
     counts: {
       expectedHoles,

@@ -8,6 +8,9 @@
 // @description  安全、可恢复地导入/导出北大树洞关注列表
 // @match        https://treehole.pku.edu.cn/web/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // @connect      127.0.0.1
 // @run-at       document-end
 // @homepageURL  https://github.com/Susurrium/PkuHoleToolkit
@@ -67,6 +70,7 @@ const ERROR_CODES = Object.freeze({
   UNAUTHORIZED: 'unauthorized',
   RATE_LIMITED: 'rate_limited',
   NETWORK_ERROR: 'network_error',
+  TIMEOUT: 'timeout',
   INVALID_RESPONSE: 'invalid_response',
   BUSINESS_ERROR: 'business_error',
   UNKNOWN_RESULT: 'unknown_result',
@@ -659,10 +663,10 @@ function concatBytes(parts) {
 }
 
 function dosDateTime(date = new Date()) {
-  const year = Math.max(1980, date.getFullYear());
+  const year = Math.max(1980, date.getUTCFullYear());
   return {
-    time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
-    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+    time: (date.getUTCHours() << 11) | (date.getUTCMinutes() << 5) | (date.getUTCSeconds() >> 1),
+    date: ((year - 1980) << 9) | ((date.getUTCMonth() + 1) << 5) | date.getUTCDate(),
   };
 }
 
@@ -812,6 +816,17 @@ function readZip(input, { maxUncompressedBytes = Infinity } = {}) {
 
 // ---- archive.js ----
 const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid|accountFingerprint/i;
+const ARCHIVE_SPEC_VERSION = '2.1.0';
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validArchiveScope(value) {
+  if (!isPlainObject(value)) return false;
+  const selector = isPlainObject(value.scope) ? value.scope : value;
+  return typeof selector.type === 'string' && selector.type.length > 0;
+}
 
 function sanitizeForArchive(value, seen = new WeakSet()) {
   if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) return value;
@@ -861,29 +876,91 @@ function legacyArchiveToItems(value) {
 
 function validateArchiveV2(manifest, data) {
   if (
-    !manifest ||
+    !isPlainObject(manifest) ||
     manifest.schemaVersion !== 2 ||
     typeof manifest.toolVersion !== 'string' ||
+    manifest.toolVersion.length === 0 ||
     typeof manifest.runId !== 'string' ||
+    manifest.runId.length === 0 ||
     typeof manifest.exportedAt !== 'string' ||
+    !Number.isFinite(Date.parse(manifest.exportedAt)) ||
+    !validArchiveScope(manifest.scope) ||
     typeof manifest.complete !== 'boolean' ||
-    !manifest.counts ||
-    !Array.isArray(manifest.errors)
+    !isPlainObject(manifest.counts) ||
+    !Array.isArray(manifest.errors) ||
+    (manifest.specVersion !== undefined && manifest.errors.some((error) => !isPlainObject(error)))
   ) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 manifest 不符合 v2 协议');
   }
-  if (!data || !Array.isArray(data.items)) {
+  if (manifest.specVersion !== undefined && !/^2\.\d+\.\d+$/.test(manifest.specVersion)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 specVersion 不受支持');
+  }
+  if (
+    manifest.producer !== undefined &&
+    (!isPlainObject(manifest.producer) ||
+      typeof manifest.producer.name !== 'string' ||
+      manifest.producer.name.length === 0 ||
+      (manifest.producer.version !== undefined &&
+        (typeof manifest.producer.version !== 'string' || manifest.producer.version.length === 0)))
+  ) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 producer 信息无效');
+  }
+  if (manifest.extensions !== undefined && !isPlainObject(manifest.extensions)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 extensions 信息无效');
+  }
+  for (const [name, descriptor] of Object.entries(manifest.extensions || {})) {
+    if (
+      !/^[a-z0-9]+(?:[.-][a-z0-9]+)+$/.test(name) ||
+      !isPlainObject(descriptor) ||
+      !Number.isInteger(descriptor.version) ||
+      descriptor.version < 1
+    ) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档扩展声明无效：${name}`);
+    }
+    if (descriptor.required === true) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档需要当前 Toolkit 不支持的扩展：${name}`);
+    }
+  }
+  for (const name of ['expectedHoles', 'exportedHoles', 'comments', 'failed', 'media', 'missingMedia', 'localTags', 'localNotes']) {
+    const value = manifest.counts[name];
+    if (value !== undefined && value !== null && (!Number.isInteger(value) || value < 0)) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `归档 counts.${name} 无效`);
+    }
+  }
+  if (manifest.requiredExtensions !== undefined) {
+    if (!Array.isArray(manifest.requiredExtensions) || manifest.requiredExtensions.some((name) => typeof name !== 'string')) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '归档 requiredExtensions 信息无效');
+    }
+    if (manifest.requiredExtensions.length > 0) {
+      throw new AppError(
+        ERROR_CODES.INVALID_INPUT,
+        `归档需要当前 Toolkit 不支持的扩展：${manifest.requiredExtensions.join(', ')}`,
+      );
+    }
+  }
+  if (!isPlainObject(data) || Object.keys(data).some((key) => key !== 'items') || !Array.isArray(data.items)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '归档缺少 data.items');
+  }
+  if (data.items.length > LIMITS.maxImportPids) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `归档记录超过 ${LIMITS.maxImportPids} 条`);
   }
   const sources = new Set(['followed', 'referenced', 'explicit', 'legacy-v1']);
   for (const item of data.items) {
     if (
-      !item ||
+      !isPlainObject(item) ||
       !PID_PATTERN.test(String(item.pid)) ||
       !sources.has(item.source) ||
       !['ok', 'partial'].includes(item.fetchStatus) ||
-      !item.hole ||
-      !Array.isArray(item.comments)
+      !isPlainObject(item.hole) ||
+      String(item.hole.pid) !== String(item.pid) ||
+      !Array.isArray(item.comments) ||
+      item.comments.some(
+        (comment) =>
+          !isPlainObject(comment) ||
+          !Number.isInteger(Number(comment.cid)) ||
+          Number(comment.cid) <= 0 ||
+          (comment.pid !== undefined && String(comment.pid) !== String(item.pid)),
+      )
     ) {
       throw new AppError(ERROR_CODES.INVALID_INPUT, '归档中存在无效的洞记录');
     }
@@ -920,15 +997,26 @@ function createManifest({
   expectedHoles = null,
   exportedAt = new Date().toISOString(),
 }) {
+  const normalizedScope = isPlainObject(scope?.scope) ? scope.scope : scope;
+  const exportOptions = isPlainObject(scope?.scope)
+    ? {
+        includeComments: scope.includeComments,
+        includeReadable: scope.includeReadable,
+        referenceMode: scope.referenceMode,
+      }
+    : undefined;
   const timestamps = items
     .map((item) => Number(item.hole?.timestamp))
     .filter((timestamp) => Number.isFinite(timestamp));
   return {
     schemaVersion: 2,
+    specVersion: ARCHIVE_SPEC_VERSION,
     toolVersion: APP_VERSION,
+    producer: { name: 'PkuHoleToolkit', version: APP_VERSION },
     runId,
     exportedAt,
-    scope: sanitizeForArchive(scope),
+    scope: sanitizeForArchive(normalizedScope),
+    ...(exportOptions ? { exportOptions: sanitizeForArchive(exportOptions) } : {}),
     complete: Boolean(complete),
     counts: {
       expectedHoles,
@@ -1012,44 +1100,478 @@ async function parseArchiveFile(file) {
 
 
 // ---- studio-bridge.js ----
+const BRIDGE_PROTOCOL = '2';
+const BRIDGE_STATE_KEY = 'pkuhole-studio-bridge-v2';
+const DEFAULT_STUDIO_PORT = 8080;
+const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000;
+const studioCapabilityCache = new Map();
+
 function parseStudioPairingCode(value) {
   const match = String(value || '').trim().match(/^(\d{1,5}):([a-f0-9]{32})$/i);
   if (!match) {
-    throw new AppError(ERROR_CODES.INVALID_INPUT, '配对码格式不正确，请从 Studio 归档导入页重新复制');
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '接收码格式不正确，请从 Studio 导入与导出页重新复制');
   }
-  const port = Number(match[1]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new AppError(ERROR_CODES.INVALID_INPUT, '配对码中的端口无效');
-  }
-  return { port, token: match[2].toLowerCase() };
+  return { port: normalizeStudioPort(match[1]), token: match[2].toLowerCase() };
 }
 
-function sendArchiveToStudio(code, archive, request = globalThis.GM_xmlhttpRequest) {
-  const { port, token } = parseStudioPairingCode(code);
-  if (!archive?.blob || !archive?.filename) {
-    return Promise.reject(new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出'));
+function normalizeStudioPort(value) {
+  const port = Number(value || DEFAULT_STUDIO_PORT);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, 'Studio 端口无效');
   }
-  if (typeof request !== 'function') {
-    return Promise.reject(new AppError(ERROR_CODES.NETWORK, '当前用户脚本管理器不支持本地桥接请求，请更新脚本后重试'));
+  return port;
+}
+
+async function sendArchiveToStudio(code, archive, request = globalThis.GM_xmlhttpRequest) {
+  const { port, token } = parseStudioPairingCode(code);
+  const bytes = await archiveBytes(archive);
+  const capabilities = await getStudioArchiveCapabilities({ port, request });
+  assertStudioCanImportArchive(capabilities, bytes, archive.filename);
+  return uploadArchive({
+    port,
+    path: `/api/v1/bridge/pairings/${token}/archive`,
+    archive,
+    request,
+    errorHint: '请确认 Studio、端口和一次性接收码均正确',
+  });
+}
+
+async function getStudioArchiveCapabilities({
+  port = DEFAULT_STUDIO_PORT,
+  request = globalThis.GM_xmlhttpRequest,
+  cacheKey,
+  now = Date.now,
+} = {}) {
+  port = normalizeStudioPort(port);
+  const key = String(cacheKey || `port:${port}`);
+  const cached = studioCapabilityCache.get(key);
+  if (cached && cached.expiresAt > now()) return cached.contract;
+  const capabilities = await studioRequest(
+    {
+      port,
+      path: '/api/v1/capabilities',
+      headers: bridgeHeaders(),
+      errorHint: '无法读取 Studio 的归档兼容能力',
+    },
+    request,
+  );
+  if (!capabilities || capabilities.archive_import !== true) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '当前 Studio 未启用归档导入能力');
+  }
+  const contract = capabilities.archive_contract || null;
+  studioCapabilityCache.set(key, { contract, expiresAt: now() + CAPABILITY_CACHE_TTL_MS });
+  return contract;
+}
+
+function clearStudioCapabilityCache() {
+  studioCapabilityCache.clear();
+}
+
+function assertStudioCanImportArchive(contract, bytes, filename = 'archive.zip') {
+  const parsed = parseArchiveBytes(bytes, filename);
+  const schemaVersion = Number(parsed.manifest?.schemaVersion || (parsed.format === 'legacy-v1' ? 1 : 0));
+  const requiredExtensions = Array.isArray(parsed.manifest?.requiredExtensions)
+    ? parsed.manifest.requiredExtensions
+    : [];
+  if (!contract) {
+    if (schemaVersion > 2 || requiredExtensions.length > 0) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, 'Studio 未声明足以读取此归档的协议能力');
+    }
+    return parsed;
+  }
+  if (!Array.isArray(contract.schema_versions) || !contract.schema_versions.includes(schemaVersion)) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, `Studio 不支持 Archive schema v${schemaVersion}`);
+  }
+  if (Array.isArray(contract.read_zip_methods) && !contract.read_zip_methods.includes('store')) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, 'Studio 未声明支持 Archive 2.1 的 ZIP STORE 基线');
+  }
+  if (Number.isFinite(contract.max_archive_bytes) && bytes.byteLength > contract.max_archive_bytes) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档超过 Studio 声明的接收上限');
+  }
+  const supportedExtensions = contract.extensions && typeof contract.extensions === 'object'
+    ? contract.extensions
+    : {};
+  for (const extensionName of requiredExtensions) {
+    const requiredVersion = parsed.manifest?.extensions?.[extensionName]?.version;
+    if (!Number.isInteger(requiredVersion) || supportedExtensions[extensionName] !== requiredVersion) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, `Studio 不支持归档必需扩展 ${extensionName}`);
+    }
+  }
+  return parsed;
+}
+
+async function requestStudioDevicePairing({
+  port = DEFAULT_STUDIO_PORT,
+  name = defaultDeviceName(),
+  request = globalThis.GM_xmlhttpRequest,
+  storage = createStudioBridgeStorage(),
+  cryptoObject = globalThis.crypto,
+} = {}) {
+  port = normalizeStudioPort(port);
+  const identity = await createStudioDeviceIdentity(cryptoObject);
+  const response = await studioRequest(
+    {
+      port,
+      method: 'POST',
+      path: '/api/v1/bridge/device-requests',
+      headers: bridgeJSONHeaders(),
+      data: JSON.stringify({ name, public_key_spki: identity.publicKeySPKI }),
+    },
+    request,
+  );
+  const pending = {
+    version: 2,
+    status: 'pending',
+    port,
+    name,
+    requestToken: response.token,
+    verificationCode: response.verification_code,
+    expiresAt: response.expires_at,
+    privateKeyPKCS8: identity.privateKeyPKCS8,
+    publicKeySPKI: identity.publicKeySPKI,
+  };
+  await storage.set(pending);
+  return pending;
+}
+
+async function refreshStudioDevicePairing({
+  state,
+  request = globalThis.GM_xmlhttpRequest,
+  storage = createStudioBridgeStorage(),
+} = {}) {
+  const current = state || (await storage.get());
+  if (!current || current.status !== 'pending') return current || null;
+  let response;
+  try {
+    response = await studioRequest(
+      {
+        port: current.port,
+        path: `/api/v1/bridge/device-requests/${current.requestToken}`,
+        headers: bridgeHeaders(),
+      },
+      request,
+    );
+  } catch (error) {
+    if (error.status === 404) await storage.delete();
+    throw error;
+  }
+  if (response.status === 'approved') {
+    const paired = {
+      version: 2,
+      status: 'paired',
+      port: current.port,
+      name: current.name,
+      deviceId: response.device_id,
+      instanceId: response.instance_id,
+      privateKeyPKCS8: current.privateKeyPKCS8,
+      publicKeySPKI: current.publicKeySPKI,
+      pairedAt: new Date().toISOString(),
+    };
+    await storage.set(paired);
+    return paired;
+  }
+  if (response.status === 'rejected') {
+    await storage.delete();
+    throw new AppError(ERROR_CODES.UNAUTHORIZED, 'Studio 已拒绝此 Toolkit 关联请求');
+  }
+  return { ...current, verificationCode: response.verification_code, expiresAt: response.expires_at };
+}
+
+async function waitForStudioDevicePairing({
+  state,
+  request = globalThis.GM_xmlhttpRequest,
+  storage = createStudioBridgeStorage(),
+  signal,
+  intervalMs = 1500,
+  onUpdate = () => {},
+} = {}) {
+  let current = state || (await storage.get());
+  if (!current) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有等待确认的 Studio 关联请求');
+  while (current?.status === 'pending') {
+    if (signal?.aborted) throw new AppError(ERROR_CODES.CANCELLED, '已取消 Studio 关联');
+    current = await refreshStudioDevicePairing({ state: current, request, storage });
+    onUpdate(current);
+    if (current?.status === 'paired') return current;
+    const expiresAt = Date.parse(current.expiresAt || '');
+    if (Number.isFinite(expiresAt) && Date.now() >= expiresAt) {
+      await storage.delete();
+      throw new AppError(ERROR_CODES.TIMEOUT, 'Studio 关联请求已过期，请重新发起');
+    }
+    await delay(intervalMs, signal);
+  }
+  return current;
+}
+
+async function sendArchiveToTrustedStudio(
+  archive,
+  {
+    state,
+    request = globalThis.GM_xmlhttpRequest,
+    storage = createStudioBridgeStorage(),
+    cryptoObject = globalThis.crypto,
+  } = {},
+) {
+  const connection = state || (await storage.get());
+  if (!connection || connection.status !== 'paired') {
+    throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 PkuHoleStudio');
+  }
+  const bytes = await archiveBytes(archive);
+  const capabilities = await getStudioArchiveCapabilities({
+    port: connection.port,
+    request,
+    cacheKey: connection.instanceId,
+  });
+  assertStudioCanImportArchive(capabilities, bytes, archive.filename);
+  const sha256 = bytesToHex(new Uint8Array(await cryptoObject.subtle.digest('SHA-256', bytes)));
+  const challenge = await studioRequest(
+    {
+      port: connection.port,
+      method: 'POST',
+      path: '/api/v1/bridge/challenges',
+      headers: bridgeJSONHeaders(),
+      data: JSON.stringify({ device_id: connection.deviceId }),
+    },
+    request,
+  );
+  if (challenge.instance_id !== connection.instanceId) {
+    throw new AppError(ERROR_CODES.UNAUTHORIZED, '当前端口上的 Studio 不是已关联的实例');
+  }
+  const signature = await signTransfer(
+    {
+      deviceId: connection.deviceId,
+      instanceId: connection.instanceId,
+      challenge: challenge.challenge,
+      filename: archive.filename,
+      size: bytes.byteLength,
+      sha256,
+      privateKeyPKCS8: connection.privateKeyPKCS8,
+    },
+    cryptoObject,
+  );
+  const transfer = await studioRequest(
+    {
+      port: connection.port,
+      method: 'POST',
+      path: '/api/v1/bridge/transfers',
+      headers: bridgeJSONHeaders(),
+      data: JSON.stringify({
+        device_id: connection.deviceId,
+        instance_id: connection.instanceId,
+        challenge: challenge.challenge,
+        filename: archive.filename,
+        size: bytes.byteLength,
+        sha256,
+        signature,
+      }),
+    },
+    request,
+  );
+  return uploadArchive({
+    port: connection.port,
+    path: `/api/v1/bridge/transfers/${transfer.id}/archive`,
+    archive: { ...archive, blob: archive.blob || new Blob([bytes], { type: 'application/zip' }) },
+    request,
+    headers: { Authorization: `Bearer ${transfer.upload_ticket}`, ...bridgeHeaders() },
+    errorHint: 'Studio 已撤销关联或传输票据已过期',
+  });
+}
+
+async function forgetStudioDevice({
+  state,
+  request = globalThis.GM_xmlhttpRequest,
+  storage = createStudioBridgeStorage(),
+  cryptoObject = globalThis.crypto,
+} = {}) {
+  const connection = state || (await storage.get());
+  let revoked = false;
+  try {
+    if (connection?.status === 'paired') {
+      const challenge = await studioRequest(
+        {
+          port: connection.port,
+          method: 'POST',
+          path: '/api/v1/bridge/challenges',
+          headers: bridgeJSONHeaders(),
+          data: JSON.stringify({ device_id: connection.deviceId }),
+        },
+        request,
+      );
+      if (challenge.instance_id !== connection.instanceId) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '当前端口上的 Studio 不是已关联的实例');
+      }
+      const message = ['pkuhole-bridge-v2-revoke', connection.deviceId, connection.instanceId, challenge.challenge].join('\n');
+      const signature = await signMessage(connection.privateKeyPKCS8, message, cryptoObject);
+      await studioRequest(
+        {
+          port: connection.port,
+          method: 'POST',
+          path: `/api/v1/bridge/devices/${connection.deviceId}/revoke`,
+          headers: bridgeJSONHeaders(),
+          data: JSON.stringify({
+            device_id: connection.deviceId,
+            instance_id: connection.instanceId,
+            challenge: challenge.challenge,
+            signature,
+          }),
+        },
+        request,
+      );
+      revoked = true;
+    }
+  } finally {
+    await storage.delete();
+  }
+  return { revoked };
+}
+
+async function restoreLatestExportArchive(store, accountFingerprint = null) {
+  const jobs = (await store.listJobs())
+    .filter(
+      (job) =>
+        job.type === 'export' &&
+        ['completed', 'partial'].includes(job.state) &&
+        job.manifest &&
+        (!accountFingerprint || job.accountFingerprint === accountFingerprint),
+    )
+    .sort((left, right) => (right.updatedAt || right.createdAt || 0) - (left.updatedAt || left.createdAt || 0));
+  const job = jobs[0];
+  if (!job) return null;
+  const items = await store.getItems(job.id);
+  if (!items.length) return null;
+  return {
+    job,
+    archive: createArchive({
+      manifest: job.manifest,
+      items,
+      includeReadable: job.options?.includeReadable !== false,
+    }),
+  };
+}
+
+function createStudioBridgeStorage({
+  getValue = globalThis.GM_getValue,
+  setValue = globalThis.GM_setValue,
+  deleteValue = globalThis.GM_deleteValue,
+} = {}) {
+  return {
+    async get() {
+      if (typeof getValue !== 'function') return null;
+      const value = await getValue(BRIDGE_STATE_KEY, null);
+      return value && value.version === 2 ? value : null;
+    },
+    async set(value) {
+      if (typeof setValue !== 'function') {
+        throw new AppError(ERROR_CODES.STORAGE_ERROR, '用户脚本管理器不支持私有设备凭据存储');
+      }
+      await setValue(BRIDGE_STATE_KEY, value);
+    },
+    async delete() {
+      if (typeof deleteValue === 'function') await deleteValue(BRIDGE_STATE_KEY);
+    },
+  };
+}
+
+async function createStudioDeviceIdentity(cryptoObject = globalThis.crypto) {
+  if (!cryptoObject?.subtle) {
+    throw new AppError(ERROR_CODES.STORAGE_ERROR, '当前浏览器不支持本机设备签名');
+  }
+  const keys = await cryptoObject.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify'],
+  );
+  const [privateKey, publicKey] = await Promise.all([
+    cryptoObject.subtle.exportKey('pkcs8', keys.privateKey),
+    cryptoObject.subtle.exportKey('spki', keys.publicKey),
+  ]);
+  return {
+    privateKeyPKCS8: bytesToBase64(new Uint8Array(privateKey)),
+    publicKeySPKI: bytesToBase64(new Uint8Array(publicKey)),
+  };
+}
+
+function transferSignatureMessage({ deviceId, instanceId, challenge, filename, size, sha256 }) {
+  return ['pkuhole-bridge-v2', deviceId, instanceId, challenge, filename, String(size), sha256].join('\n');
+}
+
+async function signTransfer(input, cryptoObject) {
+  return signMessage(input.privateKeyPKCS8, transferSignatureMessage(input), cryptoObject);
+}
+
+async function signMessage(privateKeyPKCS8, messageText, cryptoObject) {
+  const privateKey = await cryptoObject.subtle.importKey(
+    'pkcs8',
+    base64ToBytes(privateKeyPKCS8),
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign'],
+  );
+  const message = new TextEncoder().encode(messageText);
+  const signature = new Uint8Array(
+    await cryptoObject.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, message),
+  );
+  return bytesToBase64(normalizeECDSASignature(signature));
+}
+
+function normalizeECDSASignature(signature) {
+  if (signature.byteLength === 64) return signature;
+  // WebCrypto normally returns IEEE-P1363 r||s. Accept DER as a defensive
+  // compatibility path for older user-script/browser combinations.
+  if (signature[0] !== 0x30) throw new AppError(ERROR_CODES.INVALID_RESPONSE, '浏览器返回了未知签名格式');
+  let offset = 2;
+  if (signature[1] & 0x80) offset = 2 + (signature[1] & 0x7f);
+  if (signature[offset++] !== 0x02) throw new AppError(ERROR_CODES.INVALID_RESPONSE, '浏览器返回了无效签名');
+  const rLength = signature[offset++];
+  const r = signature.slice(offset, offset + rLength);
+  offset += rLength;
+  if (signature[offset++] !== 0x02) throw new AppError(ERROR_CODES.INVALID_RESPONSE, '浏览器返回了无效签名');
+  const sLength = signature[offset++];
+  const s = signature.slice(offset, offset + sLength);
+  const raw = new Uint8Array(64);
+  raw.set(r.slice(Math.max(0, r.length - 32)), 32 - Math.min(32, r.length));
+  raw.set(s.slice(Math.max(0, s.length - 32)), 64 - Math.min(32, s.length));
+  return raw;
+}
+
+async function uploadArchive({ port, path, archive, request, headers = {}, errorHint }) {
+  if (!archive?.blob || !archive?.filename) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
   }
   const body = new FormData();
   body.append('file', archive.blob, archive.filename);
+  return studioRequest(
+    { port, method: 'POST', path, headers, data: body, timeout: 120_000, errorHint },
+    request,
+  );
+}
+
+function studioRequest(options, request = globalThis.GM_xmlhttpRequest) {
+  if (typeof request !== 'function') {
+    return Promise.reject(new AppError(ERROR_CODES.NETWORK_ERROR, '当前用户脚本管理器不支持本地桥接请求'));
+  }
+  const port = normalizeStudioPort(options.port);
   return new Promise((resolve, reject) => {
     request({
-      method: 'POST',
-      url: `http://127.0.0.1:${port}/api/v1/bridge/pairings/${token}/archive`,
-      data: body,
-      timeout: 120_000,
+      method: options.method || 'GET',
+      url: `http://127.0.0.1:${port}${options.path}`,
+      headers: options.headers,
+      data: options.data,
+      timeout: options.timeout || 20_000,
       onload(response) {
         let decoded;
         try {
           decoded = JSON.parse(response.responseText || '{}');
-        } catch {
-          reject(new AppError(ERROR_CODES.NETWORK, 'Studio 返回了无法识别的响应'));
+        } catch (error) {
+          reject(new AppError(ERROR_CODES.INVALID_RESPONSE, 'Studio 返回了无法识别的响应', { cause: error, status: response.status }));
           return;
         }
         if (response.status < 200 || response.status >= 300) {
-          reject(new AppError(ERROR_CODES.INVALID_INPUT, decoded?.error?.message || `Studio 拒绝了归档 (${response.status})`));
+          reject(
+            new AppError(ERROR_CODES.INVALID_INPUT, decoded?.error?.message || options.errorHint || `Studio 拒绝了请求 (${response.status})`, {
+              status: response.status,
+              details: decoded?.error?.details,
+            }),
+          );
           return;
         }
         resolve(decoded.data);
@@ -1058,9 +1580,59 @@ function sendArchiveToStudio(code, archive, request = globalThis.GM_xmlhttpReque
         reject(new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
       },
       onerror() {
-        reject(new AppError(ERROR_CODES.NETWORK, '无法连接 Studio，请确认程序、端口和配对码均正确'));
+        reject(new AppError(ERROR_CODES.NETWORK_ERROR, options.errorHint || '无法连接本机 Studio'));
       },
     });
+  });
+}
+
+function bridgeHeaders() {
+  return { 'X-PkuHole-Toolkit': BRIDGE_PROTOCOL };
+}
+
+function bridgeJSONHeaders() {
+  return { ...bridgeHeaders(), 'Content-Type': 'application/json' };
+}
+
+async function archiveBytes(archive) {
+  if (archive?.bytes instanceof Uint8Array) return archive.bytes;
+  if (archive?.blob?.arrayBuffer) return new Uint8Array(await archive.blob.arrayBuffer());
+  throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+}
+
+function bytesToHex(bytes) {
+  return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function defaultDeviceName() {
+  const browser = String(globalThis.navigator?.userAgent || '').includes('Firefox') ? 'Firefox' : 'Browser';
+  return `${browser} Toolkit`;
+}
+
+function delay(milliseconds, signal) {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -1922,9 +2494,18 @@ function panelTemplate() {
             <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
             <div class="status-card">
               <h3>发送到 PkuHoleStudio</h3>
-              <p class="message">先完成上方导出，再粘贴 Studio“归档导入”页生成的一次性配对码。这里只发送归档，不发送登录信息。</p>
-              <div class="field"><label for="studio-pairing-code">一次性配对码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
-              <div class="actions"><button type="button" data-action="send-studio" disabled>发送刚导出的归档</button></div>
+              <p class="message" data-studio-connection>尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。</p>
+              <div class="grid">
+                <div class="field"><label for="studio-port">本机 Studio 端口</label><input id="studio-port" inputmode="numeric" value="8080"></div>
+              </div>
+              <div class="actions"><button type="button" data-action="pair-studio">关联本机 Studio</button><button type="button" data-action="refresh-studio">检查关联状态</button><button type="button" data-action="forget-studio">撤销/忘记关联</button></div>
+              <div class="actions"><button type="button" data-action="send-studio" disabled>发送到已关联 Studio</button><button type="button" data-action="download-last-export" disabled>重新下载最近归档</button></div>
+              <details>
+                <summary>兼容旧版 Toolkit：一次性接收码</summary>
+                <p class="message">请先完成导出，再到 Studio 生成 15 分钟有效的一次性接收码。</p>
+                <div class="field"><label for="studio-pairing-code">一次性接收码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+                <div class="actions"><button type="button" data-action="send-studio-legacy" disabled>使用接收码发送</button></div>
+              </details>
             </div>
           </section>
           <section data-panel="import" hidden>
@@ -1981,8 +2562,12 @@ function mountToolkit({
   let lastExportOptions = null;
   let importPreview = null;
   let lastArchive = null;
+  let studioBridgeState = null;
+  let pairingWatch = null;
+  let isRunning = false;
   let bookmarksLoaded = false;
   const mountedAt = Date.now();
+  const studioBridgeStorage = createStudioBridgeStorage();
 
   if (!entry) {
     entry = documentObject.createElement('button');
@@ -2002,16 +2587,23 @@ function mountToolkit({
 
   const $ = (selector) => shadow.querySelector(selector);
   const overlay = $('.overlay');
-  const statusCard = $('.status-card');
   const statusLabel = $('[data-state]');
+  const statusCard = statusLabel.closest('.status-card');
   const countLabel = $('[data-count]');
   const progress = $('progress');
-  const message = $('.message');
+  const message = statusCard.querySelector('.message');
   const pauseButton = $('[data-action="pause"]');
   const resumeButton = $('[data-action="resume"]');
   const cancelButton = $('[data-action="cancel"]');
   const retryButton = $('[data-action="retry"]');
   const importExecuteButton = $('[data-action="execute-import"]');
+  const studioConnectionMessage = $('[data-studio-connection]');
+  const studioPairButton = $('[data-action="pair-studio"]');
+  const studioRefreshButton = $('[data-action="refresh-studio"]');
+  const studioForgetButton = $('[data-action="forget-studio"]');
+  const studioSendButton = $('[data-action="send-studio"]');
+  const studioLegacySendButton = $('[data-action="send-studio-legacy"]');
+  const lastExportDownloadButton = $('[data-action="download-last-export"]');
 
   function placeEntry() {
     const anchor = documentObject.querySelector('div.search-btn');
@@ -2035,19 +2627,42 @@ function mountToolkit({
   }
 
   function setRunning(running) {
+    isRunning = running;
     statusCard.setAttribute('aria-busy', String(running));
     pauseButton.disabled = !running;
     cancelButton.disabled = !running;
     resumeButton.disabled = running || !activeJobId;
     retryButton.disabled = running || !activeJobId;
     $('[data-action="export"]').disabled = running;
-    $('[data-action="send-studio"]').disabled = running || !lastArchive;
+    studioSendButton.disabled = running || !lastArchive || studioBridgeState?.status !== 'paired';
+    studioLegacySendButton.disabled = running || !lastArchive;
+    lastExportDownloadButton.disabled = running || !lastArchive;
+    studioPairButton.disabled = running || studioBridgeState?.status === 'paired' || studioBridgeState?.status === 'pending';
+    studioRefreshButton.disabled = running || !studioBridgeState;
+    studioForgetButton.disabled = running || !studioBridgeState;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
       running ||
       !importPreview ||
       importPreview.remoteComplete !== true ||
       importPreview.newPids?.length === 0;
+  }
+
+  function renderStudioBridgeState() {
+    const state = studioBridgeState;
+    if (state?.status === 'paired') {
+      studioConnectionMessage.textContent = `已关联 ${state.name || 'Toolkit 设备'}，发送时会自动申请仅对当前归档有效的一次性票据。`;
+      $('#studio-port').value = String(state.port || 8080);
+      studioPairButton.textContent = 'Studio 已关联';
+    } else if (state?.status === 'pending') {
+      studioConnectionMessage.textContent = `等待 Studio 确认。请在 Studio“Toolkit 传输”页核对：${state.verificationCode || '------'}`;
+      $('#studio-port').value = String(state.port || 8080);
+      studioPairButton.textContent = '等待 Studio 确认';
+    } else {
+      studioConnectionMessage.textContent = '尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。';
+      studioPairButton.textContent = '关联本机 Studio';
+    }
+    setRunning(isRunning);
   }
 
   function handleProgress(event) {
@@ -2098,6 +2713,12 @@ function mountToolkit({
   async function discoverResumableJob() {
     try {
       const credentials = await credentialsProvider();
+      const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
+      if (restored) {
+        lastArchive = restored.archive;
+        lastExportOptions = restored.job.options;
+        setRunning(false);
+      }
       const jobs = (await store.listJobs())
         .filter(
           (job) =>
@@ -2106,7 +2727,10 @@ function mountToolkit({
         )
         .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
       const job = jobs[0];
-      if (!job) return;
+      if (!job) {
+        if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
+        return;
+      }
       activeJobId = job.id;
       activeKind = job.type;
       if (job.type === 'export') lastExportOptions = job.options;
@@ -2281,10 +2905,112 @@ function mountToolkit({
     }
   }
 
-  async function sendToStudio() {
+  async function refreshStudioConnection() {
+    try {
+      studioBridgeState = await studioBridgeStorage.get();
+      if (studioBridgeState?.status === 'pending') {
+        studioBridgeState = await refreshStudioDevicePairing({ state: studioBridgeState, storage: studioBridgeStorage });
+      }
+    } catch (error) {
+      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) studioBridgeState = null;
+      else throw error;
+    } finally {
+      renderStudioBridgeState();
+    }
+    return studioBridgeState;
+  }
+
+  function watchStudioPairing(state) {
+    if (pairingWatch || state?.status !== 'pending') return;
+    pairingWatch = waitForStudioDevicePairing({
+      state,
+      storage: studioBridgeStorage,
+      onUpdate(next) {
+        studioBridgeState = next;
+        renderStudioBridgeState();
+      },
+    })
+      .then((paired) => {
+        studioBridgeState = paired;
+        renderStudioBridgeState();
+        statusLabel.textContent = 'studio_paired';
+        setMessage('Studio 关联成功。今后可直接发送，不再复制接收码。');
+      })
+      .catch((error) => {
+        studioBridgeState = null;
+        renderStudioBridgeState();
+        statusLabel.textContent = 'failed';
+        setMessage(error.message || 'Studio 关联失败', true);
+      })
+      .finally(() => {
+        pairingWatch = null;
+      });
+  }
+
+  async function pairStudio() {
+    const port = $('#studio-port').value.trim();
+    setRunning(true);
+    statusLabel.textContent = 'pairing_studio';
+    setMessage('正在向本机 Studio 发起关联请求…');
+    try {
+      studioBridgeState = await requestStudioDevicePairing({ port, storage: studioBridgeStorage });
+      renderStudioBridgeState();
+      const studioURL = `http://127.0.0.1:${studioBridgeState.port}/imports?view=bridge`;
+      windowObject.open?.(studioURL, '_blank', 'noopener');
+      setMessage(`关联请求已发出，请在 Studio 核对 ${studioBridgeState.verificationCode} 并确认。`);
+      watchStudioPairing(studioBridgeState);
+    } catch (error) {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '无法发起 Studio 关联', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function sendToTrustedStudio() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+    if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
+    setRunning(true);
+    statusLabel.textContent = 'sending';
+    setMessage('正在签名并把归档发送到已关联 Studio…');
+    try {
+      const result = await sendArchiveToTrustedStudio(lastArchive, { state: studioBridgeState, storage: studioBridgeStorage });
+      statusLabel.textContent = 'awaiting_confirmation';
+      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+    } catch (error) {
+      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) {
+        await studioBridgeStorage.delete();
+        studioBridgeState = null;
+        renderStudioBridgeState();
+      }
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function forgetStudioConnection() {
+    const previous = studioBridgeState;
+    setRunning(true);
+    try {
+      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
+      studioBridgeState = null;
+      renderStudioBridgeState();
+      setMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地关联请求。');
+    } catch (error) {
+      studioBridgeState = null;
+      renderStudioBridgeState();
+      setMessage(`本地关联已删除；Studio 当前不可达，稍后可在 Studio 设备列表清理。${error.message ? `（${error.message}）` : ''}`);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function sendToStudioWithCode() {
     if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
     const code = $('#studio-pairing-code').value.trim();
-    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性配对码');
+    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在把归档发送到本机 Studio…');
@@ -2301,11 +3027,20 @@ function mountToolkit({
     }
   }
 
+  function downloadLastExport() {
+    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有可重新下载的完成归档');
+    downloadBlob(documentObject, lastArchive.blob, lastArchive.filename);
+    setMessage(`已重新下载 ${lastArchive.filename}`);
+  }
+
   function openPanel() {
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
     $('.close').focus();
     discoverResumableJob();
+    refreshStudioConnection()
+      .then((state) => watchStudioPairing(state))
+      .catch((error) => setMessage(error.message || '读取 Studio 关联状态失败', true));
   }
 
   function closePanel() {
@@ -2340,11 +3075,34 @@ function mountToolkit({
     runExport(lastExportOptions);
   });
   $('[data-action="send-studio"]').addEventListener('click', () =>
-    sendToStudio().catch((error) => {
+    sendToTrustedStudio().catch((error) => {
       statusLabel.textContent = 'failed';
       setMessage(error.message || '发送到 Studio 失败', true);
     }),
   );
+  $('[data-action="send-studio-legacy"]').addEventListener('click', () =>
+    sendToStudioWithCode().catch((error) => {
+      statusLabel.textContent = 'failed';
+      setMessage(error.message || '发送到 Studio 失败', true);
+    }),
+  );
+  studioPairButton.addEventListener('click', () => pairStudio());
+  studioForgetButton.addEventListener('click', () => forgetStudioConnection());
+  studioRefreshButton.addEventListener('click', () =>
+    refreshStudioConnection()
+      .then((state) => {
+        watchStudioPairing(state);
+        if (state?.status === 'paired') setMessage('Studio 关联有效，可以直接发送。');
+      })
+      .catch((error) => setMessage(error.message || '检查 Studio 关联失败', true)),
+  );
+  lastExportDownloadButton.addEventListener('click', () => {
+    try {
+      downloadLastExport();
+    } catch (error) {
+      setMessage(error.message, true);
+    }
+  });
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
