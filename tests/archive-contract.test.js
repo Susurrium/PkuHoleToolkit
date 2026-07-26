@@ -72,7 +72,7 @@ test('Toolkit writes v2.1 producer metadata and a direct portable scope', () => 
   });
   assert.equal(manifest.schemaVersion, 2);
   assert.equal(manifest.specVersion, ARCHIVE_SPEC_VERSION);
-  assert.deepEqual(manifest.producer, { name: 'PkuHoleToolkit', version: '1.3.0' });
+  assert.deepEqual(manifest.producer, { name: 'PkuHoleToolkit', version: '1.4.0' });
   assert.deepEqual(manifest.scope, { type: 'pids', pids: ['123456'] });
   assert.equal(manifest.exportOptions.referenceMode, 'body');
 });

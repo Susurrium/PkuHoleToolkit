@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-07-26
+
 - 归档生成后可独立选择“下载到本机”与“发送到已关联 Studio”，也可同时执行；默认继续下载到本机，未选择 Studio 时不会探测本机端口。
 - 下载与 Studio 传输复用同一份已生成归档；Studio 未关联或发送失败不会把已经完成的抓取误报为失败，最近归档仍可重新下载或发送。
 - archive v2 接入中立的 PkuHole Archive Contract 2.1.0：新归档携带 `specVersion`、`producer` 和直接可移植的 scope；旧 v2 继续兼容。
