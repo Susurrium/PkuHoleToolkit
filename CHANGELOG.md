@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 归档生成后可独立选择“下载到本机”与“发送到已关联 Studio”，也可同时执行；默认继续下载到本机，未选择 Studio 时不会探测本机端口。
+- 下载与 Studio 传输复用同一份已生成归档；Studio 未关联或发送失败不会把已经完成的抓取误报为失败，最近归档仍可重新下载或发送。
 - archive v2 接入中立的 PkuHole Archive Contract 2.1.0：新归档携带 `specVersion`、`producer` 和直接可移植的 scope；旧 v2 继续兼容。
 - Toolkit 使用与 Studio 相同的有效/无效 fixtures 执行契约测试，并拒绝无效时间、错误记录形状和未知必需扩展。
 - 向 Studio 发送前会读取其原生归档能力，核对 schema、必需扩展和文件大小；不兼容时在签名和上传前终止。

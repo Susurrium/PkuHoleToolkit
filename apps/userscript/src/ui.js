@@ -14,6 +14,77 @@ import {
 
 const ENTRY_ID = 'pku-hole-toolkit-entry';
 const HOST_ID = 'pku-hole-toolkit-host';
+const DELIVERY_PREFERENCE_KEY = 'pkuhole-export-delivery-v1';
+
+export function normalizeArchiveDestinations(value) {
+  if (!value || typeof value !== 'object') return { download: true, studio: false };
+  return {
+    download: value.download === true,
+    studio: value.studio === true,
+  };
+}
+
+export function readArchiveDestinations(storage) {
+  try {
+    const encoded = storage?.getItem?.(DELIVERY_PREFERENCE_KEY);
+    return encoded ? normalizeArchiveDestinations(JSON.parse(encoded)) : normalizeArchiveDestinations();
+  } catch {
+    return normalizeArchiveDestinations();
+  }
+}
+
+export function writeArchiveDestinations(storage, value) {
+  const destinations = normalizeArchiveDestinations(value);
+  try {
+    storage?.setItem?.(DELIVERY_PREFERENCE_KEY, JSON.stringify(destinations));
+  } catch {
+    // Exporting must remain available when browser storage is blocked or full.
+  }
+  return destinations;
+}
+
+export async function deliverArchiveToDestinations({
+  archive,
+  destinations,
+  studioConnected = false,
+  downloadArchive = () => {},
+  sendArchiveToStudio = async () => null,
+}) {
+  const selected = normalizeArchiveDestinations(destinations);
+  const delivery = {
+    download: selected.download ? 'ready' : 'not_selected',
+    studio: selected.studio ? 'ready' : 'not_selected',
+    studioResult: null,
+    downloadError: null,
+    studioError: null,
+  };
+  if (selected.download) {
+    try {
+      await downloadArchive(archive);
+      delivery.download = 'started';
+    } catch (error) {
+      delivery.download = 'failed';
+      delivery.downloadError = error;
+    }
+  }
+  if (!selected.studio) return delivery;
+  if (!studioConnected) {
+    delivery.studio = 'not_connected';
+    delivery.studioError = new AppError(
+      ERROR_CODES.UNAUTHORIZED,
+      '归档已经生成，但 Studio 尚未关联；可以先下载，或关联后发送最近归档',
+    );
+    return delivery;
+  }
+  try {
+    delivery.studioResult = await sendArchiveToStudio(archive);
+    delivery.studio = 'awaiting_confirmation';
+  } catch (error) {
+    delivery.studio = 'failed';
+    delivery.studioError = error;
+  }
+  return delivery;
+}
 
 export function ensureEntryBeforeAnchor(entry, anchor) {
   if (!entry || !anchor?.parentNode) return false;
@@ -46,6 +117,9 @@ const PANEL_STYLES = `
   .checks { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 14px 0; }
   .checks label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
   .checks input { width: auto; }
+  fieldset { min-width: 0; margin: 16px 0 0; padding: 14px; border: 1px solid #d7dbe1; border-radius: 10px; }
+  fieldset legend { padding: 0 6px; }
+  .hint { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: #68707c; }
   button { border: 1px solid #aeb4bd; border-radius: 8px; padding: 9px 14px; background: #f7f8fa; color: #202124; cursor: pointer; }
   button.primary { border-color: #1a73e8; background: #1a73e8; color: #fff; }
   button.danger { border-color: #c5221f; color: #c5221f; }
@@ -67,7 +141,8 @@ const PANEL_STYLES = `
     button { background: #303134; border-color: #5f6368; color: #e8eaed; }
     button.primary { background: #8ab4f8; border-color: #8ab4f8; color: #202124; }
     .status-card { background: #263248; border-color: #3b4e6d; }
-    .preview { border-color: #5f6368; }
+    .preview, fieldset { border-color: #5f6368; }
+    .hint { color: #bdc1c6; }
   }
 `;
 
@@ -93,7 +168,15 @@ function panelTemplate() {
               <div class="field"><label for="reference-mode">引用洞</label><select id="reference-mode"><option value="none">不抓取</option><option value="body">仅正文引用</option><option value="all">正文和评论引用</option></select></div>
             </div>
             <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>包含 readable.txt</label></div>
-            <div class="actions"><button class="primary" type="button" data-action="export">开始导出</button></div>
+            <fieldset>
+              <legend>归档生成后</legend>
+              <div class="checks">
+                <label><input id="delivery-download" type="checkbox">下载归档到本机</label>
+                <label><input id="delivery-studio" type="checkbox">发送到已关联 Studio</label>
+              </div>
+              <p class="hint">可以同时选择。两种输出复用同一份归档；未选择 Studio 时不会连接本机端口。</p>
+            </fieldset>
+            <div class="actions"><button class="primary" type="button" data-action="export">开始生成归档</button></div>
             <div class="status-card">
               <h3>发送到 PkuHoleStudio</h3>
               <p class="message" data-studio-connection>尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。</p>
@@ -170,6 +253,13 @@ export function mountToolkit({
   let bookmarksLoaded = false;
   const mountedAt = Date.now();
   const studioBridgeStorage = createStudioBridgeStorage();
+  let preferenceStorage = null;
+  try {
+    preferenceStorage = windowObject.localStorage;
+  } catch {
+    // Some hardened browser profiles deny access to origin storage.
+  }
+  const savedDestinations = readArchiveDestinations(preferenceStorage);
 
   if (!entry) {
     entry = documentObject.createElement('button');
@@ -206,6 +296,10 @@ export function mountToolkit({
   const studioSendButton = $('[data-action="send-studio"]');
   const studioLegacySendButton = $('[data-action="send-studio-legacy"]');
   const lastExportDownloadButton = $('[data-action="download-last-export"]');
+  const deliveryDownload = $('#delivery-download');
+  const deliveryStudio = $('#delivery-studio');
+  deliveryDownload.checked = savedDestinations.download;
+  deliveryStudio.checked = savedDestinations.studio;
 
   function placeEntry() {
     const anchor = documentObject.querySelector('div.search-btn');
@@ -242,6 +336,8 @@ export function mountToolkit({
     studioPairButton.disabled = running || studioBridgeState?.status === 'paired' || studioBridgeState?.status === 'pending';
     studioRefreshButton.disabled = running || !studioBridgeState;
     studioForgetButton.disabled = running || !studioBridgeState;
+    deliveryDownload.disabled = running;
+    deliveryStudio.disabled = running;
     $('[data-action="preview-import"]').disabled = running;
     importExecuteButton.disabled =
       running ||
@@ -372,7 +468,65 @@ export function mountToolkit({
     };
   }
 
+  function archiveDestinations() {
+    return writeArchiveDestinations(preferenceStorage, {
+      download: deliveryDownload.checked,
+      studio: deliveryStudio.checked,
+    });
+  }
+
+  async function deliverExportArchive(archive, destinations) {
+    const delivery = await deliverArchiveToDestinations({
+      archive,
+      destinations,
+      studioConnected: studioBridgeState?.status === 'paired',
+      downloadArchive: (value) => downloadBlob(documentObject, value.blob, value.filename),
+      sendArchiveToStudio: (value) => sendArchiveToTrustedStudio(value, {
+        state: studioBridgeState,
+        storage: studioBridgeStorage,
+      }),
+    });
+    const studioError = delivery.studioError;
+    if (
+      delivery.studio === 'failed' &&
+      studioError &&
+      (studioError.status === 404 || studioError.code === ERROR_CODES.UNAUTHORIZED)
+    ) {
+      await studioBridgeStorage.delete();
+      studioBridgeState = null;
+      renderStudioBridgeState();
+    }
+    return delivery;
+  }
+
+  function deliveryMessage(delivery) {
+    const messages = [];
+    if (delivery.download === 'started') messages.push('已开始下载本地归档');
+    else if (delivery.download === 'failed') {
+      messages.push(`启动本地下载失败：${delivery.downloadError?.message || '未知错误'}`);
+    }
+    if (delivery.studio === 'awaiting_confirmation') {
+      messages.push(
+        `已发送到 Studio 并通过预检（${delivery.studioResult?.preflight?.counts?.valid_items ?? '?'} 个有效帖子），请在 Studio 确认导入`,
+      );
+    } else if (delivery.studio === 'not_connected') {
+      messages.push('尚未发送到 Studio：请先完成关联');
+    } else if (delivery.studio === 'failed') {
+      messages.push(`发送 Studio 失败：${delivery.studioError?.message || '未知错误'}`);
+    }
+    return messages.join('；');
+  }
+
   async function runExport(options, jobId = null) {
+    const destinations = archiveDestinations();
+    if (!destinations.download && !destinations.studio) {
+      setMessage('请至少选择“下载归档到本机”或“发送到已关联 Studio”之一', true);
+      return;
+    }
+    if (destinations.studio && !destinations.download && studioBridgeState?.status !== 'paired') {
+      setMessage('当前只选择了发送 Studio，请先关联本机 Studio；也可以同时选择下载到本机', true);
+      return;
+    }
     setRunning(true);
     setMessage('正在规划导出范围…');
     statusLabel.textContent = 'planning';
@@ -395,14 +549,16 @@ export function mountToolkit({
         return;
       }
       lastArchive = result.archive;
-      downloadBlob(documentObject, result.archive.blob, result.archive.filename);
+      const delivery = await deliverExportArchive(result.archive, destinations);
       statusLabel.textContent = result.job.state;
       countLabel.textContent = `${result.manifest.counts.exportedHoles} / ${result.manifest.counts.expectedHoles ?? '?'}`;
-      setMessage(
-        result.manifest.complete
+      const archiveMessage = result.manifest.complete
           ? '导出完成。断点保留 7 天，可重新下载。'
-          : `部分导出：${result.manifest.errors.length} 项失败，请查看 manifest 或重试。`,
-        !result.manifest.complete,
+          : `部分导出：${result.manifest.errors.length} 项失败，请查看 manifest 或重试。`;
+      const sentMessage = deliveryMessage(delivery);
+      setMessage(
+        sentMessage ? `${archiveMessage}\n${sentMessage}。` : archiveMessage,
+        !result.manifest.complete || Boolean(delivery.downloadError || delivery.studioError),
       );
     } catch (error) {
       activeJobId = activeJobId || activeJob?.jobId || null;
@@ -676,6 +832,8 @@ export function mountToolkit({
     lastExportOptions = exportOptions();
     runExport(lastExportOptions);
   });
+  deliveryDownload.addEventListener('change', archiveDestinations);
+  deliveryStudio.addEventListener('change', archiveDestinations);
   $('[data-action="send-studio"]').addEventListener('click', () =>
     sendToTrustedStudio().catch((error) => {
       statusLabel.textContent = 'failed';

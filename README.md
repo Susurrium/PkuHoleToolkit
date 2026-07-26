@@ -7,6 +7,7 @@
 - 从当前登录账号导出全部关注、指定收藏分组、指定 PID 或日期范围。
 - 可选择正文、评论以及正文/评论中的一层 `#PID` 引用。
 - 默认生成一个 `.treehole.zip`，包含 `manifest.json`、`data.json` 和可选的 `readable.txt`。
+- 归档生成后可下载到本机、发送到已关联 PkuHoleStudio，或同时执行；Toolkit 不依赖 Studio，未选择 Studio 时不会连接本机端口。
 - 可与本机 PkuHoleStudio 一次关联、持续使用；刷新页面后仍可恢复最近完成的归档并重新发送。发送前先协商 Studio 的归档 schema、扩展与大小上限，上传后由 Studio 预检，再由用户确认导入。旧版一次性接收码继续作为兼容入口。
 - 能力协商按 Studio 实例短时缓存；Archive 2.1 使用 ZIP STORE 作为双方都能读取的写入基线，并通过 Toolkit/Studio 真实导出黄金包持续做双向测试。
 - 支持暂停、取消、七天内恢复，以及只重试未完整项目。
