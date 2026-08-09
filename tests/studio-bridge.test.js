@@ -12,6 +12,7 @@ import {
   transferSignatureMessage,
 } from '../apps/userscript/src/studio-bridge.js';
 import { createArchive, createManifest } from '../apps/userscript/src/archive.js';
+import { ERROR_CODES } from '../apps/userscript/src/errors.js';
 import { MemoryJobStore } from '../apps/userscript/src/storage.js';
 
 test.beforeEach(() => clearStudioCapabilityCache());
@@ -173,6 +174,129 @@ test('pairs once and signs each trusted Studio transfer', async () => {
   assert.equal(forgotten.revoked, true);
   assert.equal(revokeRequest.device_id, 'device-1');
   assert.ok(revokeRequest.signature);
+  assert.equal(stored, null);
+});
+
+test('cancelling a pending pairing aborts its active Studio request', async () => {
+  const state = {
+    version: 2,
+    status: 'pending',
+    port: 8080,
+    requestToken: 'request-token',
+  };
+  const controller = new AbortController();
+  let requestAborted = false;
+  const refreshing = refreshStudioDevicePairing({
+    state,
+    signal: controller.signal,
+    storage: {
+      async get() { return state; },
+      async set() {},
+      async delete() {},
+    },
+    request() {
+      return {
+        abort() {
+          requestAborted = true;
+        },
+      };
+    },
+  });
+
+  controller.abort();
+  await assert.rejects(refreshing, (error) => error.code === ERROR_CODES.CANCELLED);
+  assert.equal(requestAborted, true);
+});
+
+test('an approval cannot overwrite a replaced pending pairing request', async () => {
+  const original = {
+    version: 2,
+    status: 'pending',
+    port: 8080,
+    requestToken: 'old-request',
+    privateKeyPKCS8: 'old-private-key',
+    publicKeySPKI: 'old-public-key',
+  };
+  const replacement = {
+    ...original,
+    requestToken: 'new-request',
+    privateKeyPKCS8: 'new-private-key',
+    publicKeySPKI: 'new-public-key',
+  };
+  let stored = original;
+  let responseOptions;
+  const storage = {
+    async get() { return stored; },
+    async set(value) { stored = value; },
+    async delete() { stored = null; },
+  };
+  const refreshing = refreshStudioDevicePairing({
+    state: original,
+    storage,
+    request(options) {
+      responseOptions = options;
+    },
+  });
+
+  stored = replacement;
+  responseOptions.onload({
+    status: 200,
+    responseText: JSON.stringify({
+      data: { status: 'approved', device_id: 'old-device', instance_id: 'old-studio' },
+    }),
+  });
+
+  await assert.rejects(refreshing, (error) => error.code === ERROR_CODES.CANCELLED);
+  assert.equal(stored, replacement);
+});
+
+test('aborting while an approved pairing is being stored removes the late write', async () => {
+  const state = {
+    version: 2,
+    status: 'pending',
+    port: 8080,
+    requestToken: 'delayed-request',
+    privateKeyPKCS8: 'private-key',
+    publicKeySPKI: 'public-key',
+  };
+  let stored = state;
+  let releaseSet;
+  let markSetStarted;
+  const setStarted = new Promise((resolve) => {
+    markSetStarted = resolve;
+  });
+  const setGate = new Promise((resolve) => {
+    releaseSet = resolve;
+  });
+  const storage = {
+    async get() { return stored; },
+    async set(value) {
+      markSetStarted();
+      await setGate;
+      stored = value;
+    },
+    async delete() { stored = null; },
+  };
+  const controller = new AbortController();
+  const refreshing = refreshStudioDevicePairing({
+    state,
+    signal: controller.signal,
+    storage,
+    request(options) {
+      options.onload({
+        status: 200,
+        responseText: JSON.stringify({
+          data: { status: 'approved', device_id: 'device-late', instance_id: 'studio-late' },
+        }),
+      });
+    },
+  });
+
+  await setStarted;
+  controller.abort();
+  releaseSet();
+
+  await assert.rejects(refreshing, (error) => error.code === ERROR_CODES.CANCELLED);
   assert.equal(stored, null);
 });
 

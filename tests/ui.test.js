@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 import {
+  abortAndWaitForPairingWatch,
+  apiForAccount,
+  createResumableJobDiscovery,
   deliverArchiveToDestinations,
   ensureEntryBeforeAnchor,
   normalizeArchiveDestinations,
   readArchiveDestinations,
+  reconcileAccountScopedState,
+  selectLatestResumableJob,
   writeArchiveDestinations,
 } from '../apps/userscript/src/ui.js';
 
@@ -51,6 +56,107 @@ test('UI bootstrap does not overwrite host onload and uses an idempotent entry i
   assert.match(ui, /pku-hole-toolkit-entry/);
   assert.match(ui, /MutationObserver/);
   assert.match(ui, /aria-live/);
+  assert.doesNotMatch(
+    ui,
+    /refreshStudioDevicePairing/,
+    'pending pairing refreshes must use the cancellable watcher',
+  );
+});
+
+test('resumable discovery includes planning jobs and ignores other accounts', () => {
+  const selected = selectLatestResumableJob(
+    [
+      { id: 'completed', accountFingerprint: 'account-a', state: 'completed', updatedAt: 50 },
+      { id: 'other-account', accountFingerprint: 'account-b', state: 'running', updatedAt: 40 },
+      { id: 'planning', accountFingerprint: 'account-a', state: 'planning', updatedAt: 30 },
+      { id: 'paused', accountFingerprint: 'account-a', state: 'paused', updatedAt: 20 },
+    ],
+    'account-a',
+  );
+
+  assert.equal(selected.id, 'planning');
+});
+
+test('resumable discovery is single-flight and does not start while a page job is busy', async () => {
+  let busy = false;
+  let calls = 0;
+  let release;
+  const firstRun = new Promise((resolve) => {
+    release = resolve;
+  });
+  const discover = createResumableJobDiscovery({
+    isBusy: () => busy,
+    async discover() {
+      calls += 1;
+      await firstRun;
+      return 'restored';
+    },
+  });
+
+  const first = discover();
+  const duplicate = discover();
+  assert.equal(first, duplicate);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+
+  busy = true;
+  assert.equal(await discover(), null);
+  assert.equal(calls, 1);
+  busy = false;
+  release();
+  assert.equal(await first, 'restored');
+});
+
+test('switching accounts clears every account-scoped archive and resume value', () => {
+  const previous = {
+    accountFingerprint: 'account-a',
+    lastArchive: { filename: 'account-a.treehole.zip' },
+    lastExportOptions: { scope: { type: 'all' } },
+    activeJobId: 'job-a',
+    activeKind: 'export',
+    importPreview: { newPids: ['123'] },
+    unrelated: 'preserved',
+  };
+
+  const unchanged = reconcileAccountScopedState(previous, 'account-a');
+  assert.equal(unchanged.accountChanged, false);
+  assert.equal(unchanged.lastArchive, previous.lastArchive);
+
+  const switched = reconcileAccountScopedState(previous, 'account-b');
+  assert.equal(switched.accountChanged, true);
+  assert.equal(switched.accountFingerprint, 'account-b');
+  assert.equal(switched.lastArchive, null);
+  assert.equal(switched.lastExportOptions, null);
+  assert.equal(switched.activeJobId, null);
+  assert.equal(switched.activeKind, null);
+  assert.equal(switched.importPreview, null);
+  assert.equal(switched.unrelated, 'preserved');
+});
+
+test('jobs use an account-bound API when available and retain mock compatibility', () => {
+  const fallback = {};
+  assert.equal(apiForAccount(fallback, 'account-a'), fallback);
+  const api = { forAccount: (fingerprint) => ({ fingerprint }) };
+  assert.deepEqual(apiForAccount(api, 'account-b'), { fingerprint: 'account-b' });
+});
+
+test('pairing cancellation waits for the aborted watcher to finish', async () => {
+  const controller = new AbortController();
+  let release;
+  const promise = new Promise((resolve) => {
+    release = resolve;
+  });
+  let cancellationFinished = false;
+  const cancellation = abortAndWaitForPairingWatch({ controller, promise }).then(() => {
+    cancellationFinished = true;
+  });
+
+  assert.equal(controller.signal.aborted, true);
+  await Promise.resolve();
+  assert.equal(cancellationFinished, false);
+  release();
+  await cancellation;
+  assert.equal(cancellationFinished, true);
 });
 
 test('archive delivery preferences default to local download and persist both destinations', () => {

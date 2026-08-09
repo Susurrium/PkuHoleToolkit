@@ -10,6 +10,15 @@ function importRunId() {
 }
 
 const IMPORTABLE_SOURCES = new Set(['followed', 'explicit', 'legacy-v1']);
+const COMPLETED_IMPORT_STATUSES = new Set([
+  'followed',
+  'followed_reconciled',
+  'already_followed',
+]);
+
+function orderedResults(pids, resultsByPid) {
+  return pids.map((pid) => resultsByPid.get(String(pid))).filter(Boolean);
+}
 
 export class ImportJob {
   constructor({ api, store, accountFingerprint, onProgress = () => {} }) {
@@ -92,6 +101,7 @@ export class ImportJob {
       const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
       const newPids = [...unique].filter((pid) => !followedPids.has(pid));
       return {
+        accountFingerprint: this.accountFingerprint,
         archives,
         allPids: [...unique],
         newPids,
@@ -108,7 +118,26 @@ export class ImportJob {
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {
-    if (!preview || preview.remoteComplete !== true) {
+    const storedJob = jobId ? await this.store.getJob(jobId) : null;
+    if (jobId && !storedJob) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '找不到要恢复的导入任务');
+    }
+    if (storedJob && storedJob.type !== 'import') {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '任务类型不是导入任务');
+    }
+    if (storedJob && storedJob.accountFingerprint !== this.accountFingerprint) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该导入断点属于另一个账号');
+    }
+    const effectivePreview = storedJob?.preview || preview;
+    const previewAccountFingerprint =
+      effectivePreview?.accountFingerprint || storedJob?.accountFingerprint;
+    if (previewAccountFingerprint !== this.accountFingerprint) {
+      throw new AppError(
+        ERROR_CODES.UNAUTHORIZED,
+        '预检账号与当前账号不一致，请重新预检后再导入',
+      );
+    }
+    if (!effectivePreview || effectivePreview.remoteComplete !== true) {
       throw new AppError(
         ERROR_CODES.INVALID_RESPONSE,
         '当前关注列表读取不完整，已禁止导入；请重新预检后再试',
@@ -121,10 +150,7 @@ export class ImportJob {
     const signal = this.controller.signal;
     this.api.scheduler?.resetRateLimitCount?.();
 
-    let job = jobId ? await this.store.getJob(jobId) : null;
-    if (job && job.accountFingerprint !== this.accountFingerprint) {
-      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该导入断点属于另一个账号');
-    }
+    let job = storedJob;
     if (!job) {
       job = {
         id: importRunId(),
@@ -132,38 +158,54 @@ export class ImportJob {
         state: JOB_STATES.PLANNING,
         createdAt: Date.now(),
         accountFingerprint: this.accountFingerprint,
-        pids: preview.newPids,
+        pids: effectivePreview.newPids,
         preview: {
-          archives: preview.archives,
-          allPids: preview.allPids,
-          newPids: preview.newPids,
-          alreadyFollowed: preview.alreadyFollowed,
-          duplicateCount: preview.duplicateCount,
-          excludedReferenced: preview.excludedReferenced,
-          invalidFiles: preview.invalidFiles,
-          remoteComplete: preview.remoteComplete,
+          accountFingerprint: effectivePreview.accountFingerprint,
+          archives: effectivePreview.archives,
+          allPids: effectivePreview.allPids,
+          newPids: effectivePreview.newPids,
+          alreadyFollowed: effectivePreview.alreadyFollowed,
+          duplicateCount: effectivePreview.duplicateCount,
+          excludedReferenced: effectivePreview.excludedReferenced,
+          invalidFiles: effectivePreview.invalidFiles,
+          remoteComplete: effectivePreview.remoteComplete,
         },
-        total: preview.newPids.length,
+        total: effectivePreview.newPids.length,
         completed: 0,
         results: [],
       };
     }
     this.jobId = job.id;
-    await this.store.putJob({ ...job, state: JOB_STATES.RUNNING });
+    job.state = JOB_STATES.RUNNING;
+    delete job.audit;
+    delete job.fatalError;
     const previous = await this.store.getItems(job.id);
-    const completedPids = new Set(previous.map((result) => result.pid));
-    const results = [...previous];
+    const jobPids = new Set(job.pids.map(String));
+    const resultsByPid = new Map(
+      previous
+        .filter((result) => jobPids.has(String(result.pid)))
+        .map((result) => [String(result.pid), result]),
+    );
+    job.completed = resultsByPid.size;
+    job.results = orderedResults(job.pids, resultsByPid);
+    await this.store.putJob(job);
 
     try {
       for (const pid of job.pids) {
         throwIfAborted(signal, 'import');
         if (this.pauseRequested) {
           job.state = JOB_STATES.PAUSED;
-          job.results = results;
+          job.results = orderedResults(job.pids, resultsByPid);
+          job.completed = job.results.length;
           await this.store.putJob(job);
-          return { job, paused: true, audit: this.buildAudit(preview, results) };
+          return {
+            job,
+            paused: true,
+            audit: this.buildAudit(effectivePreview, job.results),
+          };
         }
-        if (completedPids.has(pid)) continue;
+        const previousResult = resultsByPid.get(String(pid));
+        if (COMPLETED_IMPORT_STATUSES.has(previousResult?.status)) continue;
         let result;
         try {
           const response = await this.api.followHole(pid, signal);
@@ -176,17 +218,24 @@ export class ImportJob {
           ) {
             throw error;
           }
-          result = { pid, status: 'failed', error: toErrorRecord(error) };
+          const errorRecord = toErrorRecord(error);
+          result = {
+            pid,
+            status: errorRecord.code === ERROR_CODES.UNKNOWN_RESULT ? 'unknown' : 'failed',
+            error: errorRecord,
+          };
         }
-        results.push(result);
-        completedPids.add(pid);
+        resultsByPid.set(String(pid), result);
         await this.store.putItem(job.id, pid, result);
-        job.completed = completedPids.size;
-        job.results = results;
+        job.completed = resultsByPid.size;
+        job.results = orderedResults(job.pids, resultsByPid);
         await this.store.putJob(job);
         this.onProgress({ ...job, type: 'progress', pid });
       }
-      const audit = this.buildAudit(preview, results);
+      const results = orderedResults(job.pids, resultsByPid);
+      const audit = this.buildAudit(effectivePreview, results);
+      job.completed = results.length;
+      job.results = results;
       job.state = audit.failed === 0 && audit.unknown === 0 ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL;
       job.audit = audit;
       await this.store.putJob(job);
@@ -217,8 +266,14 @@ export class ImportJob {
       followed: count(['followed', 'followed_reconciled']),
       skipped: count(['already_followed']),
       notFound: results.filter((result) => result.error?.code === ERROR_CODES.NOT_FOUND).length,
-      unknown: results.filter((result) => result.error?.code === ERROR_CODES.UNKNOWN_RESULT).length,
-      failed: count(['failed']),
+      unknown: results.filter(
+        (result) =>
+          result.status === 'unknown' || result.error?.code === ERROR_CODES.UNKNOWN_RESULT,
+      ).length,
+      failed: results.filter(
+        (result) =>
+          result.status === 'failed' && result.error?.code !== ERROR_CODES.UNKNOWN_RESULT,
+      ).length,
       results,
     };
   }

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { ExportJob, referencesFromText } from '../apps/userscript/src/export-job.js';
 import { ImportJob } from '../apps/userscript/src/import-job.js';
 import { MemoryJobStore } from '../apps/userscript/src/storage.js';
+import { AppError, ERROR_CODES } from '../apps/userscript/src/errors.js';
 import {
   createArchive,
   createManifest,
@@ -122,6 +123,7 @@ test('import preview deduplicates legacy files and execute records an audit', as
     onProgress: (event) => previewProgress.push(event),
   });
   const preview = await job.preview([file]);
+  assert.equal(preview.accountFingerprint, 'fingerprint');
   assert.ok(previewProgress.some((event) => event.phase === 'archive_files'));
   assert.ok(previewProgress.some((event) => event.phase === 'remote_followed'));
   assert.deepEqual(preview.newPids, ['234567']);
@@ -194,10 +196,328 @@ test('import execution refuses an incomplete remote follow snapshot', async () =
     accountFingerprint: 'fingerprint',
   });
   await assert.rejects(
-    job.execute({ remoteComplete: false, newPids: ['123456'] }),
+    job.execute({
+      accountFingerprint: 'fingerprint',
+      remoteComplete: false,
+      newPids: ['123456'],
+    }),
     (error) => error.code === 'invalid_response',
   );
   assert.equal(followCalls, 0);
+});
+
+test('import execution keeps the in-memory job running until it is paused', async () => {
+  const store = new MemoryJobStore();
+  const progressStates = [];
+  let job;
+  job = new ImportJob({
+    api: {
+      scheduler: { resetRateLimitCount() {} },
+      async followHole(pid) {
+        return { status: 'followed', pid };
+      },
+    },
+    store,
+    accountFingerprint: 'fingerprint',
+    onProgress(event) {
+      if (event.pid) {
+        progressStates.push(event.state);
+        job.requestPause();
+      }
+    },
+  });
+  const preview = {
+    accountFingerprint: 'fingerprint',
+    archives: [],
+    allPids: ['123456', '234567'],
+    newPids: ['123456', '234567'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+
+  const result = await job.execute(preview);
+
+  assert.equal(result.paused, true);
+  assert.deepEqual(progressStates, ['running']);
+  assert.equal(result.job.state, 'paused');
+  assert.equal(result.job.completed, 1);
+  const storedJob = await store.getJob(result.job.id);
+  assert.equal(storedJob.state, 'paused');
+  assert.equal(storedJob.completed, 1);
+});
+
+test('import resume rebuilds progress from persisted PID items before continuing', async () => {
+  const store = new MemoryJobStore();
+  const jobId = 'crash-window-import';
+  const preview = {
+    accountFingerprint: 'fingerprint',
+    archives: [],
+    allPids: ['123456', '234567'],
+    newPids: ['123456', '234567'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+  await store.putJob({
+    id: jobId,
+    type: 'import',
+    state: 'running',
+    createdAt: Date.now(),
+    accountFingerprint: 'fingerprint',
+    pids: preview.newPids,
+    preview,
+    total: 2,
+    completed: 0,
+    results: [],
+  });
+  // Simulate a crash after the item transaction committed but before the job
+  // progress transaction could be updated.
+  await store.putItem(jobId, '123456', { pid: '123456', status: 'followed' });
+
+  const calls = [];
+  let synchronizedJob;
+  const result = await new ImportJob({
+    api: {
+      scheduler: { resetRateLimitCount() {} },
+      async followHole(pid) {
+        calls.push(pid);
+        synchronizedJob = await store.getJob(jobId);
+        return { status: 'followed', pid };
+      },
+    },
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview, { jobId });
+
+  assert.deepEqual(calls, ['234567']);
+  assert.equal(synchronizedJob.state, 'running');
+  assert.equal(synchronizedJob.completed, 1);
+  assert.deepEqual(synchronizedJob.results, [{ pid: '123456', status: 'followed' }]);
+  assert.equal(result.job.state, 'completed');
+  assert.equal(result.job.completed, 2);
+  assert.equal(result.job.results.length, 2);
+  assert.equal((await store.getJob(jobId)).completed, 2);
+});
+
+test('import retry replaces failed PID results while preserving successful PIDs', async () => {
+  const calls = [];
+  let firstAttempt = true;
+  const store = new MemoryJobStore();
+  const api = {
+    scheduler: { resetRateLimitCount() {} },
+    async followHole(pid) {
+      calls.push(pid);
+      if (pid === '123456' && firstAttempt) throw new Error('temporary failure');
+      return { status: 'followed', pid };
+    },
+  };
+  const preview = {
+    accountFingerprint: 'fingerprint',
+    archives: [],
+    allPids: ['123456', '234567'],
+    newPids: ['123456', '234567'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+  const first = await new ImportJob({
+    api,
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview);
+  assert.equal(first.audit.failed, 1);
+
+  firstAttempt = false;
+  const retried = await new ImportJob({
+    api,
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview, { jobId: first.job.id });
+
+  assert.deepEqual(calls, ['123456', '234567', '123456']);
+  assert.equal(retried.audit.followed, 2);
+  assert.equal(retried.audit.failed, 0);
+  assert.equal(retried.audit.results.length, 2);
+  assert.deepEqual(
+    retried.audit.results.map((result) => result.pid),
+    ['123456', '234567'],
+  );
+  assert.equal((await store.getItems(first.job.id)).length, 2);
+});
+
+test('import retry re-enters followHole for an unknown result so it can reconcile first', async () => {
+  let calls = 0;
+  const store = new MemoryJobStore();
+  const api = {
+    scheduler: { resetRateLimitCount() {} },
+    async followHole(pid) {
+      calls += 1;
+      if (calls === 1) {
+        throw new AppError(ERROR_CODES.UNKNOWN_RESULT, 'result unknown');
+      }
+      // followHole owns the GET-before-POST safety check; this represents its
+      // retry-time GET finding that the first write actually succeeded.
+      return { status: 'already_followed', pid };
+    },
+  };
+  const preview = {
+    accountFingerprint: 'fingerprint',
+    archives: [],
+    allPids: ['123456'],
+    newPids: ['123456'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+  const first = await new ImportJob({
+    api,
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview);
+  assert.equal(first.audit.unknown, 1);
+  assert.equal(first.audit.failed, 0);
+  assert.equal(first.audit.results[0].status, 'unknown');
+
+  const retried = await new ImportJob({
+    api,
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview, { jobId: first.job.id });
+
+  assert.equal(calls, 2);
+  assert.equal(retried.audit.unknown, 0);
+  assert.equal(retried.audit.skipped, 1);
+  assert.equal(retried.audit.results.length, 1);
+  assert.equal(retried.audit.results[0].status, 'already_followed');
+});
+
+test('import execution rejects a preview created for another account', async () => {
+  let followCalls = 0;
+  const job = new ImportJob({
+    api: {
+      async followHole() {
+        followCalls += 1;
+        return { status: 'followed' };
+      },
+    },
+    store: new MemoryJobStore(),
+    accountFingerprint: 'current-account',
+  });
+
+  await assert.rejects(
+    job.execute({
+      accountFingerprint: 'preview-account',
+      remoteComplete: true,
+      newPids: ['123456'],
+    }),
+    (error) => error.code === ERROR_CODES.UNAUTHORIZED,
+  );
+  assert.equal(followCalls, 0);
+});
+
+test('import execution resumes a v1.4 job whose stored preview predates account binding', async () => {
+  const store = new MemoryJobStore();
+  const jobId = 'legacy-import-job';
+  const preview = {
+    archives: [],
+    allPids: ['123456'],
+    newPids: ['123456'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+  await store.putJob({
+    id: jobId,
+    type: 'import',
+    state: 'planning',
+    createdAt: Date.now(),
+    accountFingerprint: 'fingerprint',
+    pids: preview.newPids,
+    preview,
+    total: 1,
+    completed: 0,
+    results: [],
+  });
+
+  const result = await new ImportJob({
+    api: {
+      scheduler: { resetRateLimitCount() {} },
+      async followHole(pid) {
+        return { status: 'followed', pid };
+      },
+    },
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(preview, { jobId });
+
+  assert.equal(result.job.state, 'completed');
+  assert.equal(result.audit.followed, 1);
+});
+
+test('import resume uses the preview and PID list saved in its checkpoint', async () => {
+  const store = new MemoryJobStore();
+  const storedPreview = {
+    accountFingerprint: 'fingerprint',
+    archives: [{ name: 'saved.zip', format: 'v2' }],
+    allPids: ['123456'],
+    newPids: ['123456'],
+    alreadyFollowed: [],
+    duplicateCount: 0,
+    excludedReferenced: 0,
+    invalidFiles: [],
+    remoteComplete: true,
+  };
+  await store.putJob({
+    id: 'saved-import',
+    type: 'import',
+    state: 'paused',
+    accountFingerprint: 'fingerprint',
+    pids: ['123456'],
+    preview: storedPreview,
+    total: 1,
+    completed: 0,
+    results: [],
+  });
+  const calls = [];
+  const result = await new ImportJob({
+    api: {
+      scheduler: { resetRateLimitCount() {} },
+      async followHole(pid) {
+        calls.push(pid);
+        return { status: 'followed', pid };
+      },
+    },
+    store,
+    accountFingerprint: 'fingerprint',
+  }).execute(
+    {
+      accountFingerprint: 'fingerprint',
+      archives: [{ name: 'stale.zip', format: 'v2' }],
+      allPids: ['654321'],
+      newPids: ['654321'],
+      alreadyFollowed: [],
+      duplicateCount: 0,
+      excludedReferenced: 0,
+      invalidFiles: [],
+      remoteComplete: true,
+    },
+    { jobId: 'saved-import' },
+  );
+
+  assert.deepEqual(calls, ['123456']);
+  assert.equal(result.audit.results[0].pid, '123456');
+  assert.equal(result.audit.totalFiles, 1);
 });
 
 test('a 2000-hole export completes without comment requests when reply count is zero', async () => {

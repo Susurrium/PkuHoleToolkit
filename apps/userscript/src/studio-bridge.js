@@ -7,6 +7,33 @@ const DEFAULT_STUDIO_PORT = 8080;
 const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000;
 const studioCapabilityCache = new Map();
 
+function pairingCancelledError() {
+  return new AppError(ERROR_CODES.CANCELLED, '已取消 Studio 关联');
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw pairingCancelledError();
+}
+
+function isSamePendingRequest(state, expected) {
+  return Boolean(
+    state?.status === 'pending' &&
+    expected?.status === 'pending' &&
+    state.requestToken &&
+    state.requestToken === expected.requestToken,
+  );
+}
+
+async function clearPairingRequestState(storage, expected) {
+  const stored = await storage.get();
+  const belongsToRequest =
+    (stored?.status === 'pending' && stored.requestToken === expected.requestToken) ||
+    (stored?.status === 'paired' &&
+      stored.publicKeySPKI &&
+      stored.publicKeySPKI === expected.publicKeySPKI);
+  if (belongsToRequest) await storage.delete();
+}
+
 export function parseStudioPairingCode(value) {
   const match = String(value || '').trim().match(/^(\d{1,5}):([a-f0-9]{32})$/i);
   if (!match) {
@@ -139,7 +166,9 @@ export async function refreshStudioDevicePairing({
   state,
   request = globalThis.GM_xmlhttpRequest,
   storage = createStudioBridgeStorage(),
+  signal,
 } = {}) {
+  throwIfAborted(signal);
   const current = state || (await storage.get());
   if (!current || current.status !== 'pending') return current || null;
   let response;
@@ -149,33 +178,47 @@ export async function refreshStudioDevicePairing({
         port: current.port,
         path: `/api/v1/bridge/device-requests/${current.requestToken}`,
         headers: bridgeHeaders(),
+        signal,
       },
       request,
     );
   } catch (error) {
-    if (error.status === 404) await storage.delete();
+    if (error.status === 404) {
+      const stored = await storage.get();
+      if (isSamePendingRequest(stored, current)) await storage.delete();
+    }
     throw error;
   }
+  throwIfAborted(signal);
+  const stored = await storage.get();
+  throwIfAborted(signal);
+  if (!isSamePendingRequest(stored, current)) throw pairingCancelledError();
   if (response.status === 'approved') {
     const paired = {
       version: 2,
       status: 'paired',
-      port: current.port,
-      name: current.name,
+      port: stored.port,
+      name: stored.name,
       deviceId: response.device_id,
       instanceId: response.instance_id,
-      privateKeyPKCS8: current.privateKeyPKCS8,
-      publicKeySPKI: current.publicKeySPKI,
+      privateKeyPKCS8: stored.privateKeyPKCS8,
+      publicKeySPKI: stored.publicKeySPKI,
       pairedAt: new Date().toISOString(),
     };
+    throwIfAborted(signal);
     await storage.set(paired);
+    if (signal?.aborted) {
+      await clearPairingRequestState(storage, current);
+      throw pairingCancelledError();
+    }
     return paired;
   }
   if (response.status === 'rejected') {
+    throwIfAborted(signal);
     await storage.delete();
     throw new AppError(ERROR_CODES.UNAUTHORIZED, 'Studio 已拒绝此 Toolkit 关联请求');
   }
-  return { ...current, verificationCode: response.verification_code, expiresAt: response.expires_at };
+  return { ...stored, verificationCode: response.verification_code, expiresAt: response.expires_at };
 }
 
 export async function waitForStudioDevicePairing({
@@ -190,7 +233,7 @@ export async function waitForStudioDevicePairing({
   if (!current) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有等待确认的 Studio 关联请求');
   while (current?.status === 'pending') {
     if (signal?.aborted) throw new AppError(ERROR_CODES.CANCELLED, '已取消 Studio 关联');
-    current = await refreshStudioDevicePairing({ state: current, request, storage });
+    current = await refreshStudioDevicePairing({ state: current, request, storage, signal });
     onUpdate(current);
     if (current?.status === 'paired') return current;
     const expiresAt = Date.parse(current.expiresAt || '');
@@ -452,38 +495,76 @@ function studioRequest(options, request = globalThis.GM_xmlhttpRequest) {
   }
   const port = normalizeStudioPort(options.port);
   return new Promise((resolve, reject) => {
-    request({
-      method: options.method || 'GET',
-      url: `http://127.0.0.1:${port}${options.path}`,
-      headers: options.headers,
-      data: options.data,
-      timeout: options.timeout || 20_000,
-      onload(response) {
-        let decoded;
-        try {
-          decoded = JSON.parse(response.responseText || '{}');
-        } catch (error) {
-          reject(new AppError(ERROR_CODES.INVALID_RESPONSE, 'Studio 返回了无法识别的响应', { cause: error, status: response.status }));
-          return;
-        }
-        if (response.status < 200 || response.status >= 300) {
-          reject(
-            new AppError(ERROR_CODES.INVALID_INPUT, decoded?.error?.message || options.errorHint || `Studio 拒绝了请求 (${response.status})`, {
-              status: response.status,
-              details: decoded?.error?.details,
-            }),
-          );
-          return;
-        }
-        resolve(decoded.data);
-      },
-      ontimeout() {
-        reject(new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
-      },
-      onerror() {
-        reject(new AppError(ERROR_CODES.NETWORK_ERROR, options.errorHint || '无法连接本机 Studio'));
-      },
-    });
+    let requestHandle = null;
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      finish(reject, pairingCancelledError());
+      try {
+        requestHandle?.abort?.();
+      } catch {
+        // The promise still settles as cancelled even if the manager cannot abort the socket.
+      }
+    };
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      requestHandle = request({
+        method: options.method || 'GET',
+        url: `http://127.0.0.1:${port}${options.path}`,
+        headers: options.headers,
+        data: options.data,
+        timeout: options.timeout || 20_000,
+        onload(response) {
+          let decoded;
+          try {
+            decoded = JSON.parse(response.responseText || '{}');
+          } catch (error) {
+            finish(
+              reject,
+              new AppError(ERROR_CODES.INVALID_RESPONSE, 'Studio 返回了无法识别的响应', {
+                cause: error,
+                status: response.status,
+              }),
+            );
+            return;
+          }
+          if (response.status < 200 || response.status >= 300) {
+            finish(
+              reject,
+              new AppError(
+                ERROR_CODES.INVALID_INPUT,
+                decoded?.error?.message || options.errorHint || `Studio 拒绝了请求 (${response.status})`,
+                {
+                  status: response.status,
+                  details: decoded?.error?.details,
+                },
+              ),
+            );
+            return;
+          }
+          finish(resolve, decoded.data);
+        },
+        ontimeout() {
+          finish(reject, new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
+        },
+        onerror() {
+          finish(reject, new AppError(ERROR_CODES.NETWORK_ERROR, options.errorHint || '无法连接本机 Studio'));
+        },
+      });
+      if (options.signal?.aborted) onAbort();
+    } catch (error) {
+      finish(reject, error);
+    }
   });
 }
 

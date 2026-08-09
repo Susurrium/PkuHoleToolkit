@@ -118,6 +118,39 @@ test('follow operation performs one POST and verifies final state', async () => 
   assert.equal(detailCalls, 2);
 });
 
+test('an account-bound follow stops before writing when credentials switch accounts', async () => {
+  const calls = [];
+  let credentialReads = 0;
+  const scheduler = {
+    async requestJson(url, options) {
+      calls.push({ url, method: options.method, uuid: options.headers.uuid });
+      return { code: 20000, data: { pid: 123456, is_follow: 0 } };
+    },
+  };
+  const api = new TreeholeApi({
+    scheduler,
+    credentialsProvider: async () => {
+      credentialReads += 1;
+      return credentialReads === 1
+        ? { token: 'token-a', uuid: 'uuid-a', accountFingerprint: 'account-a' }
+        : { token: 'token-b', uuid: 'uuid-b', accountFingerprint: 'account-b' };
+    },
+  }).forAccount('account-a');
+
+  await assert.rejects(
+    api.followHole('123456'),
+    (error) => error.code === ERROR_CODES.UNAUTHORIZED && error.operation === 'follow_hole',
+  );
+  assert.equal(credentialReads, 2);
+  assert.deepEqual(calls, [
+    {
+      url: 'https://treehole.pku.edu.cn/api/pku/123456/',
+      method: 'GET',
+      uuid: 'uuid-a',
+    },
+  ]);
+});
+
 test('ambiguous POST failure is reconciled with one final read and no repeated write', async () => {
   let detailCalls = 0;
   let postCalls = 0;

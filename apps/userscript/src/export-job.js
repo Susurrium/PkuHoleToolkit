@@ -14,6 +14,50 @@ function createRunId(now = new Date()) {
   return `${timestamp}-${suffix}`;
 }
 
+const LOCAL_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+function invalidScope(message) {
+  throw new AppError(ERROR_CODES.INVALID_INPUT, message);
+}
+
+function normalizeDate(value, fieldName) {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = String(value).trim();
+  const match = normalized.match(LOCAL_DATE_PATTERN);
+  if (!match) invalidScope(`${fieldName}必须使用 YYYY-MM-DD 格式`);
+
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (year === 0) invalidScope(`${fieldName}不是有效日期`);
+  const date = new Date(year, month - 1, day);
+  if (year >= 0 && year < 100) date.setFullYear(year);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    invalidScope(`${fieldName}不是有效日期`);
+  }
+  return normalized;
+}
+
+function localDateTimestamp(value, endOfDay = false) {
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(
+    year,
+    month - 1,
+    day,
+    endOfDay ? 23 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 999 : 0,
+  );
+  if (year >= 0 && year < 100) date.setFullYear(year);
+  return date.getTime() / 1000;
+}
+
 export function referencesFromText(text) {
   const pids = [];
   if (!text) return pids;
@@ -24,19 +68,42 @@ export function referencesFromText(text) {
   return pids;
 }
 
+function normalizeScope(scope) {
+  let bookmarkId = null;
+  let pids = [];
+  let startDate = null;
+  let endDate = null;
+
+  if (scope.type === 'group') {
+    bookmarkId =
+      scope.bookmarkId === undefined || scope.bookmarkId === null
+        ? null
+        : String(scope.bookmarkId).trim() || null;
+    if (!bookmarkId) invalidScope('分组导出必须选择收藏分组');
+  }
+  if (scope.type === 'pids') {
+    pids = Array.isArray(scope.pids) ? [...new Set(scope.pids.map(normalizePid))] : [];
+    if (pids.length === 0) invalidScope('指定 PID 导出至少需要一个 PID');
+  }
+  if (scope.type === 'date') {
+    startDate = normalizeDate(scope.startDate, '开始日期');
+    endDate = normalizeDate(scope.endDate, '结束日期');
+    if (!startDate && !endDate) invalidScope('日期导出至少需要填写开始日期或结束日期');
+    if (startDate && endDate && startDate > endDate) {
+      invalidScope('开始日期不能晚于结束日期');
+    }
+  }
+
+  return { type: scope.type, bookmarkId, pids, startDate, endDate };
+}
+
 function normalizedOptions(options = {}) {
   const scope = options.scope || { type: 'all' };
   if (!['all', 'group', 'pids', 'date'].includes(scope.type)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '未知导出范围');
   }
   return {
-    scope: {
-      type: scope.type,
-      bookmarkId: scope.bookmarkId ? String(scope.bookmarkId) : null,
-      pids: Array.isArray(scope.pids) ? [...new Set(scope.pids.map(normalizePid))] : [],
-      startDate: scope.startDate || null,
-      endDate: scope.endDate || null,
-    },
+    scope: normalizeScope(scope),
     includeComments: options.includeComments !== false,
     includeReadable: options.includeReadable !== false,
     referenceMode: ['none', 'body', 'all'].includes(options.referenceMode)
@@ -48,8 +115,8 @@ function normalizedOptions(options = {}) {
 
 function filterByDate(holes, scope) {
   if (scope.type !== 'date') return holes;
-  const start = scope.startDate ? Date.parse(scope.startDate) / 1000 : -Infinity;
-  const end = scope.endDate ? (Date.parse(scope.endDate) + 86_399_999) / 1000 : Infinity;
+  const start = scope.startDate ? localDateTimestamp(scope.startDate) : -Infinity;
+  const end = scope.endDate ? localDateTimestamp(scope.endDate, true) : Infinity;
   return holes.filter((hole) => {
     const timestamp = Number(hole.timestamp);
     return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end;
@@ -199,14 +266,14 @@ export class ExportJob {
 
   async run(rawOptions = null, { jobId = null, signal: externalSignal } = {}) {
     this.pauseRequested = false;
-    this.controller = new AbortController();
-    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
-    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
-    const signal = this.controller.signal;
-    this.api.scheduler?.resetRateLimitCount?.();
-
     let job = jobId ? await this.store.getJob(jobId) : null;
-    const options = normalizedOptions(rawOptions || job?.options);
+    if (jobId && !job) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '找不到要恢复的导出任务');
+    }
+    if (job && job.type !== 'export') {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '任务类型不是导出任务');
+    }
+    const options = normalizedOptions(job ? job.options : rawOptions);
     if (job && job.accountFingerprint !== this.accountFingerprint) {
       throw new AppError(ERROR_CODES.UNAUTHORIZED, '该断点属于另一个账号，不能恢复');
     }
@@ -229,6 +296,11 @@ export class ExportJob {
       job.errors = [];
     }
     this.jobId = job.id;
+    this.controller = new AbortController();
+    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    const signal = this.controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
 
     try {
       await this.saveState(job, JOB_STATES.PLANNING);

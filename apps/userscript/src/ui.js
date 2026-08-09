@@ -4,7 +4,6 @@ import { AppError, ERROR_CODES, toErrorRecord } from './errors.js';
 import {
   createStudioBridgeStorage,
   forgetStudioDevice,
-  refreshStudioDevicePairing,
   requestStudioDevicePairing,
   restoreLatestExportArchive,
   sendArchiveToStudio,
@@ -91,6 +90,64 @@ export function ensureEntryBeforeAnchor(entry, anchor) {
   if (entry.parentNode === anchor.parentNode && entry.nextSibling === anchor) return false;
   anchor.parentNode.insertBefore(entry, anchor);
   return true;
+}
+
+export function selectLatestResumableJob(jobs, accountFingerprint) {
+  return [...(jobs || [])]
+    .filter(
+      (job) =>
+        job.accountFingerprint === accountFingerprint &&
+        ['planning', 'running', 'paused', 'partial'].includes(job.state),
+    )
+    .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0] || null;
+}
+
+export function createResumableJobDiscovery({ isBusy, discover }) {
+  let inFlight = null;
+  return function discoverOnce() {
+    if (isBusy()) return Promise.resolve(null);
+    if (!inFlight) {
+      const pending = Promise.resolve()
+        .then(() => (isBusy() ? null : discover()))
+        .finally(() => {
+          if (inFlight === pending) inFlight = null;
+        });
+      inFlight = pending;
+    }
+    return inFlight;
+  };
+}
+
+export function reconcileAccountScopedState(state, accountFingerprint) {
+  const accountChanged = Boolean(
+    state.accountFingerprint &&
+    accountFingerprint &&
+    state.accountFingerprint !== accountFingerprint,
+  );
+  return {
+    ...state,
+    accountFingerprint,
+    accountChanged,
+    ...(accountChanged
+      ? {
+          lastArchive: null,
+          lastExportOptions: null,
+          activeJobId: null,
+          activeKind: null,
+          importPreview: null,
+        }
+      : {}),
+  };
+}
+
+export function apiForAccount(api, accountFingerprint) {
+  return typeof api?.forAccount === 'function' ? api.forAccount(accountFingerprint) : api;
+}
+
+export async function abortAndWaitForPairingWatch(watch) {
+  if (!watch) return;
+  watch.controller.abort();
+  await watch.promise;
 }
 
 const PANEL_STYLES = `
@@ -251,6 +308,7 @@ export function mountToolkit({
   let pairingWatch = null;
   let isRunning = false;
   let bookmarksLoaded = false;
+  let loadedAccountFingerprint = null;
   const mountedAt = Date.now();
   const studioBridgeStorage = createStudioBridgeStorage();
   let preferenceStorage = null;
@@ -346,6 +404,42 @@ export function mountToolkit({
       importPreview.newPids?.length === 0;
   }
 
+  function useAccountFingerprint(accountFingerprint) {
+    const next = reconcileAccountScopedState(
+      {
+        accountFingerprint: loadedAccountFingerprint,
+        lastArchive,
+        lastExportOptions,
+        activeJobId,
+        activeKind,
+        importPreview,
+      },
+      accountFingerprint,
+    );
+    loadedAccountFingerprint = next.accountFingerprint;
+    if (!next.accountChanged) return false;
+    lastArchive = next.lastArchive;
+    lastExportOptions = next.lastExportOptions;
+    activeJobId = next.activeJobId;
+    activeKind = next.activeKind;
+    importPreview = next.importPreview;
+    bookmarksLoaded = false;
+    $('#bookmark').replaceChildren();
+    const previewElement = $('[data-import-preview]');
+    previewElement.hidden = true;
+    previewElement.textContent = '';
+    setRunning(isRunning);
+    return true;
+  }
+
+  async function credentialsForCurrentAccount() {
+    const credentials = await credentialsProvider();
+    return {
+      credentials,
+      accountChanged: useAccountFingerprint(credentials.accountFingerprint),
+    };
+  }
+
   function renderStudioBridgeState() {
     const state = studioBridgeState;
     if (state?.status === 'paired') {
@@ -379,10 +473,11 @@ export function mountToolkit({
   }
 
   async function ensureBookmarks() {
-    if (bookmarksLoaded) return;
     const select = $('#bookmark');
     try {
-      const bookmarks = await api.listBookmarks();
+      const { credentials } = await credentialsForCurrentAccount();
+      if (bookmarksLoaded) return;
+      const bookmarks = await apiForAccount(api, credentials.accountFingerprint).listBookmarks();
       select.replaceChildren(
         ...bookmarks.map((bookmark) => {
           const option = documentObject.createElement('option');
@@ -408,48 +503,47 @@ export function mountToolkit({
     }
   }
 
-  async function discoverResumableJob() {
-    try {
-      const credentials = await credentialsProvider();
-      const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
-      if (restored) {
-        lastArchive = restored.archive;
-        lastExportOptions = restored.job.options;
+  const discoverResumableJob = createResumableJobDiscovery({
+    isBusy: () => Boolean(activeJob || isRunning),
+    async discover() {
+      try {
+        const { credentials } = await credentialsForCurrentAccount();
+        if (activeJob || isRunning) return null;
+        const [restored, jobs] = await Promise.all([
+          restoreLatestExportArchive(store, credentials.accountFingerprint),
+          store.listJobs(),
+        ]);
+        if (activeJob || isRunning) return null;
+        if (restored) {
+          lastArchive = restored.archive;
+          lastExportOptions = restored.job.options;
+        }
+        let job = selectLatestResumableJob(jobs, credentials.accountFingerprint);
+        if (!job) {
+          setRunning(false);
+          if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
+          return null;
+        }
+        if (['planning', 'running'].includes(job.state)) {
+          job = { ...job, state: 'paused' };
+          await store.putJob(job);
+          if (activeJob || isRunning) return null;
+        }
+        activeJobId = job.id;
+        activeKind = job.type;
+        if (job.type === 'export') lastExportOptions = job.options;
+        if (job.type === 'import') importPreview = job.preview;
+        statusLabel.textContent = 'paused';
+        countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
+        setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
         setRunning(false);
+        return job;
+      } catch (error) {
+        if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
+        return null;
       }
-      const jobs = (await store.listJobs())
-        .filter(
-          (job) =>
-            job.accountFingerprint === credentials.accountFingerprint &&
-            ['running', 'paused', 'partial'].includes(job.state),
-        )
-        .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
-      const job = jobs[0];
-      if (!job) {
-        if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
-        return;
-      }
-      activeJobId = job.id;
-      activeKind = job.type;
-      if (job.type === 'export') lastExportOptions = job.options;
-      if (job.type === 'import') importPreview = job.preview;
-      if (job.state === 'running') {
-        job.state = 'paused';
-        await store.putJob(job);
-      }
-      statusLabel.textContent = 'paused';
-      countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
-      setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
-      resumeButton.disabled = false;
-      retryButton.disabled = false;
-      importExecuteButton.disabled = !importPreview;
-      if (importPreview?.remoteComplete !== true || importPreview?.newPids?.length === 0) {
-        importExecuteButton.disabled = true;
-      }
-    } catch (error) {
-      if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
-    }
-  }
+    },
+  });
 
   function exportOptions() {
     const type = $('#scope').value;
@@ -527,14 +621,25 @@ export function mountToolkit({
       setMessage('当前只选择了发送 Studio，请先关联本机 Studio；也可以同时选择下载到本机', true);
       return;
     }
+    if (!jobId) {
+      activeJobId = null;
+      activeKind = null;
+    }
     setRunning(true);
     setMessage('正在规划导出范围…');
     statusLabel.textContent = 'planning';
     try {
-      const credentials = await credentialsProvider();
+      const { credentials, accountChanged } = await credentialsForCurrentAccount();
+      if (accountChanged && jobId) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '账号已切换，不能恢复旧账号的导出任务');
+      }
+      if (accountChanged && options?.scope?.type === 'group') {
+        await ensureBookmarks();
+        throw new AppError(ERROR_CODES.INVALID_INPUT, '账号已切换，请重新选择收藏分组');
+      }
       activeKind = 'export';
       activeJob = new ExportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -573,16 +678,18 @@ export function mountToolkit({
   async function previewImport() {
     const files = [...$('#archive-files').files];
     if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
+    activeJobId = null;
+    activeKind = null;
     setRunning(true);
     statusLabel.textContent = 'previewing';
     countLabel.textContent = '0 / ?';
     progress.removeAttribute('value');
     setMessage('正在解析归档并读取当前关注列表；关注较多时可能需要几十秒…');
     try {
-      const credentials = await credentialsProvider();
+      const { credentials } = await credentialsForCurrentAccount();
       activeKind = 'import';
       activeJob = new ImportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -618,20 +725,24 @@ export function mountToolkit({
   }
 
   async function executeImport(jobId = null) {
-    if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
-    if (
-      !windowObject.confirm(
-        `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
-      )
-    ) {
-      return;
-    }
     setRunning(true);
     try {
-      const credentials = await credentialsProvider();
+      const { credentials, accountChanged } = await credentialsForCurrentAccount();
+      if (accountChanged) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '账号已切换，请在当前账号重新预检');
+      }
+      if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
+      if (
+        !windowObject.confirm(
+          `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
+        )
+      ) {
+        return;
+      }
+      if (!jobId) activeJobId = null;
       activeKind = 'import';
       activeJob = new ImportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -664,11 +775,12 @@ export function mountToolkit({
   }
 
   async function refreshStudioConnection() {
+    if (pairingWatch && studioBridgeState?.status === 'pending') {
+      renderStudioBridgeState();
+      return studioBridgeState;
+    }
     try {
       studioBridgeState = await studioBridgeStorage.get();
-      if (studioBridgeState?.status === 'pending') {
-        studioBridgeState = await refreshStudioDevicePairing({ state: studioBridgeState, storage: studioBridgeStorage });
-      }
     } catch (error) {
       if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) studioBridgeState = null;
       else throw error;
@@ -678,30 +790,60 @@ export function mountToolkit({
     return studioBridgeState;
   }
 
+  async function cancelStudioPairingWatch() {
+    const watch = pairingWatch;
+    if (!watch) return;
+    pairingWatch = null;
+    await abortAndWaitForPairingWatch(watch);
+  }
+
   function watchStudioPairing(state) {
     if (pairingWatch || state?.status !== 'pending') return;
-    pairingWatch = waitForStudioDevicePairing({
+    const Controller = windowObject.AbortController || globalThis.AbortController;
+    const watch = {
+      controller: new Controller(),
+      requestToken: state.requestToken,
+      promise: null,
+    };
+    pairingWatch = watch;
+    watch.promise = waitForStudioDevicePairing({
       state,
       storage: studioBridgeStorage,
+      signal: watch.controller.signal,
       onUpdate(next) {
+        if (
+          pairingWatch !== watch ||
+          watch.controller.signal.aborted ||
+          (next?.status === 'pending' && next.requestToken !== watch.requestToken)
+        ) {
+          return;
+        }
         studioBridgeState = next;
         renderStudioBridgeState();
       },
     })
       .then((paired) => {
+        if (pairingWatch !== watch || watch.controller.signal.aborted) return;
         studioBridgeState = paired;
         renderStudioBridgeState();
         statusLabel.textContent = 'studio_paired';
         setMessage('Studio 关联成功。今后可直接发送，不再复制接收码。');
       })
       .catch((error) => {
+        if (
+          pairingWatch !== watch ||
+          watch.controller.signal.aborted ||
+          error.code === ERROR_CODES.CANCELLED
+        ) {
+          return;
+        }
         studioBridgeState = null;
         renderStudioBridgeState();
         statusLabel.textContent = 'failed';
         setMessage(error.message || 'Studio 关联失败', true);
       })
       .finally(() => {
-        pairingWatch = null;
+        if (pairingWatch === watch) pairingWatch = null;
       });
   }
 
@@ -711,6 +853,17 @@ export function mountToolkit({
     statusLabel.textContent = 'pairing_studio';
     setMessage('正在向本机 Studio 发起关联请求…');
     try {
+      await cancelStudioPairingWatch();
+      const previous = await studioBridgeStorage.get();
+      if (previous?.status === 'paired') {
+        studioBridgeState = previous;
+        renderStudioBridgeState();
+        setMessage('Studio 已完成关联，无需重新发起。');
+        return;
+      }
+      if (previous?.status === 'pending') await studioBridgeStorage.delete();
+      studioBridgeState = null;
+      renderStudioBridgeState();
       studioBridgeState = await requestStudioDevicePairing({ port, storage: studioBridgeStorage });
       renderStudioBridgeState();
       const studioURL = `http://127.0.0.1:${studioBridgeState.port}/imports?view=bridge`;
@@ -726,17 +879,21 @@ export function mountToolkit({
   }
 
   async function sendToTrustedStudio() {
-    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
-    if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在签名并把归档发送到已关联 Studio…');
     try {
+      await credentialsForCurrentAccount();
+      if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+      if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
       const result = await sendArchiveToTrustedStudio(lastArchive, { state: studioBridgeState, storage: studioBridgeStorage });
       statusLabel.textContent = 'awaiting_confirmation';
       setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
     } catch (error) {
-      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) {
+      if (
+        error.status === 404 ||
+        (error.code === ERROR_CODES.UNAUTHORIZED && error.operation !== 'credentials')
+      ) {
         await studioBridgeStorage.delete();
         studioBridgeState = null;
         renderStudioBridgeState();
@@ -749,12 +906,13 @@ export function mountToolkit({
   }
 
   async function forgetStudioConnection() {
-    const previous = studioBridgeState;
     setRunning(true);
     try {
-      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
+      await cancelStudioPairingWatch();
+      const previous = (await studioBridgeStorage.get()) || studioBridgeState;
       studioBridgeState = null;
       renderStudioBridgeState();
+      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
       setMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地关联请求。');
     } catch (error) {
       studioBridgeState = null;
@@ -766,13 +924,14 @@ export function mountToolkit({
   }
 
   async function sendToStudioWithCode() {
-    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
-    const code = $('#studio-pairing-code').value.trim();
-    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在把归档发送到本机 Studio…');
     try {
+      await credentialsForCurrentAccount();
+      if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+      const code = $('#studio-pairing-code').value.trim();
+      if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
       const result = await sendArchiveToStudio(code, lastArchive);
       statusLabel.textContent = 'awaiting_confirmation';
       setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
@@ -785,7 +944,8 @@ export function mountToolkit({
     }
   }
 
-  function downloadLastExport() {
+  async function downloadLastExport() {
+    await credentialsForCurrentAccount();
     if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有可重新下载的完成归档');
     downloadBlob(documentObject, lastArchive.blob, lastArchive.filename);
     setMessage(`已重新下载 ${lastArchive.filename}`);
@@ -856,20 +1016,21 @@ export function mountToolkit({
       })
       .catch((error) => setMessage(error.message || '检查 Studio 关联失败', true)),
   );
-  lastExportDownloadButton.addEventListener('click', () => {
-    try {
-      downloadLastExport();
-    } catch (error) {
-      setMessage(error.message, true);
-    }
-  });
+  lastExportDownloadButton.addEventListener('click', () =>
+    downloadLastExport().catch((error) => setMessage(error.message, true)),
+  );
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
       setMessage(error.message, true);
     }),
   );
-  importExecuteButton.addEventListener('click', () => executeImport());
+  importExecuteButton.addEventListener('click', () =>
+    executeImport().catch((error) => {
+      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setMessage(error.message, true);
+    }),
+  );
   pauseButton.addEventListener('click', () => {
     activeJob?.requestPause();
     setMessage('将在当前洞处理完成后暂停…');
@@ -911,6 +1072,7 @@ export function mountToolkit({
     close: closePanel,
     destroy() {
       clearTimeout(fallbackTimer);
+      void cancelStudioPairingWatch();
       observer.disconnect();
       entry.remove();
       host.remove();

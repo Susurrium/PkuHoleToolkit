@@ -63,13 +63,34 @@ function normalizePaginator(value, operation, fallbackPage = 1) {
 }
 
 export class TreeholeApi {
-  constructor({ scheduler, credentialsProvider }) {
+  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null }) {
     this.scheduler = scheduler;
     this.credentialsProvider = credentialsProvider;
+    this.expectedAccountFingerprint = expectedAccountFingerprint;
+  }
+
+  forAccount(accountFingerprint) {
+    const expectedAccountFingerprint = String(accountFingerprint || '').trim();
+    if (!expectedAccountFingerprint) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '无法绑定空账号指纹');
+    }
+    return new TreeholeApi({
+      scheduler: this.scheduler,
+      credentialsProvider: this.credentialsProvider,
+      expectedAccountFingerprint,
+    });
   }
 
   async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
     const credentials = await this.credentialsProvider();
+    if (
+      this.expectedAccountFingerprint &&
+      credentials.accountFingerprint !== this.expectedAccountFingerprint
+    ) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', {
+        operation,
+      });
+    }
     const body = await this.scheduler.requestJson(
       apiUrl(path, params),
       {

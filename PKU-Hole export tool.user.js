@@ -442,13 +442,34 @@ function normalizePaginator(value, operation, fallbackPage = 1) {
 }
 
 class TreeholeApi {
-  constructor({ scheduler, credentialsProvider }) {
+  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null }) {
     this.scheduler = scheduler;
     this.credentialsProvider = credentialsProvider;
+    this.expectedAccountFingerprint = expectedAccountFingerprint;
+  }
+
+  forAccount(accountFingerprint) {
+    const expectedAccountFingerprint = String(accountFingerprint || '').trim();
+    if (!expectedAccountFingerprint) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '无法绑定空账号指纹');
+    }
+    return new TreeholeApi({
+      scheduler: this.scheduler,
+      credentialsProvider: this.credentialsProvider,
+      expectedAccountFingerprint,
+    });
   }
 
   async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
     const credentials = await this.credentialsProvider();
+    if (
+      this.expectedAccountFingerprint &&
+      credentials.accountFingerprint !== this.expectedAccountFingerprint
+    ) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', {
+        operation,
+      });
+    }
     const body = await this.scheduler.requestJson(
       apiUrl(path, params),
       {
@@ -1106,6 +1127,33 @@ const DEFAULT_STUDIO_PORT = 8080;
 const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000;
 const studioCapabilityCache = new Map();
 
+function pairingCancelledError() {
+  return new AppError(ERROR_CODES.CANCELLED, '已取消 Studio 关联');
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw pairingCancelledError();
+}
+
+function isSamePendingRequest(state, expected) {
+  return Boolean(
+    state?.status === 'pending' &&
+    expected?.status === 'pending' &&
+    state.requestToken &&
+    state.requestToken === expected.requestToken,
+  );
+}
+
+async function clearPairingRequestState(storage, expected) {
+  const stored = await storage.get();
+  const belongsToRequest =
+    (stored?.status === 'pending' && stored.requestToken === expected.requestToken) ||
+    (stored?.status === 'paired' &&
+      stored.publicKeySPKI &&
+      stored.publicKeySPKI === expected.publicKeySPKI);
+  if (belongsToRequest) await storage.delete();
+}
+
 function parseStudioPairingCode(value) {
   const match = String(value || '').trim().match(/^(\d{1,5}):([a-f0-9]{32})$/i);
   if (!match) {
@@ -1238,7 +1286,9 @@ async function refreshStudioDevicePairing({
   state,
   request = globalThis.GM_xmlhttpRequest,
   storage = createStudioBridgeStorage(),
+  signal,
 } = {}) {
+  throwIfAborted(signal);
   const current = state || (await storage.get());
   if (!current || current.status !== 'pending') return current || null;
   let response;
@@ -1248,33 +1298,47 @@ async function refreshStudioDevicePairing({
         port: current.port,
         path: `/api/v1/bridge/device-requests/${current.requestToken}`,
         headers: bridgeHeaders(),
+        signal,
       },
       request,
     );
   } catch (error) {
-    if (error.status === 404) await storage.delete();
+    if (error.status === 404) {
+      const stored = await storage.get();
+      if (isSamePendingRequest(stored, current)) await storage.delete();
+    }
     throw error;
   }
+  throwIfAborted(signal);
+  const stored = await storage.get();
+  throwIfAborted(signal);
+  if (!isSamePendingRequest(stored, current)) throw pairingCancelledError();
   if (response.status === 'approved') {
     const paired = {
       version: 2,
       status: 'paired',
-      port: current.port,
-      name: current.name,
+      port: stored.port,
+      name: stored.name,
       deviceId: response.device_id,
       instanceId: response.instance_id,
-      privateKeyPKCS8: current.privateKeyPKCS8,
-      publicKeySPKI: current.publicKeySPKI,
+      privateKeyPKCS8: stored.privateKeyPKCS8,
+      publicKeySPKI: stored.publicKeySPKI,
       pairedAt: new Date().toISOString(),
     };
+    throwIfAborted(signal);
     await storage.set(paired);
+    if (signal?.aborted) {
+      await clearPairingRequestState(storage, current);
+      throw pairingCancelledError();
+    }
     return paired;
   }
   if (response.status === 'rejected') {
+    throwIfAborted(signal);
     await storage.delete();
     throw new AppError(ERROR_CODES.UNAUTHORIZED, 'Studio 已拒绝此 Toolkit 关联请求');
   }
-  return { ...current, verificationCode: response.verification_code, expiresAt: response.expires_at };
+  return { ...stored, verificationCode: response.verification_code, expiresAt: response.expires_at };
 }
 
 async function waitForStudioDevicePairing({
@@ -1289,7 +1353,7 @@ async function waitForStudioDevicePairing({
   if (!current) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有等待确认的 Studio 关联请求');
   while (current?.status === 'pending') {
     if (signal?.aborted) throw new AppError(ERROR_CODES.CANCELLED, '已取消 Studio 关联');
-    current = await refreshStudioDevicePairing({ state: current, request, storage });
+    current = await refreshStudioDevicePairing({ state: current, request, storage, signal });
     onUpdate(current);
     if (current?.status === 'paired') return current;
     const expiresAt = Date.parse(current.expiresAt || '');
@@ -1551,38 +1615,76 @@ function studioRequest(options, request = globalThis.GM_xmlhttpRequest) {
   }
   const port = normalizeStudioPort(options.port);
   return new Promise((resolve, reject) => {
-    request({
-      method: options.method || 'GET',
-      url: `http://127.0.0.1:${port}${options.path}`,
-      headers: options.headers,
-      data: options.data,
-      timeout: options.timeout || 20_000,
-      onload(response) {
-        let decoded;
-        try {
-          decoded = JSON.parse(response.responseText || '{}');
-        } catch (error) {
-          reject(new AppError(ERROR_CODES.INVALID_RESPONSE, 'Studio 返回了无法识别的响应', { cause: error, status: response.status }));
-          return;
-        }
-        if (response.status < 200 || response.status >= 300) {
-          reject(
-            new AppError(ERROR_CODES.INVALID_INPUT, decoded?.error?.message || options.errorHint || `Studio 拒绝了请求 (${response.status})`, {
-              status: response.status,
-              details: decoded?.error?.details,
-            }),
-          );
-          return;
-        }
-        resolve(decoded.data);
-      },
-      ontimeout() {
-        reject(new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
-      },
-      onerror() {
-        reject(new AppError(ERROR_CODES.NETWORK_ERROR, options.errorHint || '无法连接本机 Studio'));
-      },
-    });
+    let requestHandle = null;
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      finish(reject, pairingCancelledError());
+      try {
+        requestHandle?.abort?.();
+      } catch {
+        // The promise still settles as cancelled even if the manager cannot abort the socket.
+      }
+    };
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      requestHandle = request({
+        method: options.method || 'GET',
+        url: `http://127.0.0.1:${port}${options.path}`,
+        headers: options.headers,
+        data: options.data,
+        timeout: options.timeout || 20_000,
+        onload(response) {
+          let decoded;
+          try {
+            decoded = JSON.parse(response.responseText || '{}');
+          } catch (error) {
+            finish(
+              reject,
+              new AppError(ERROR_CODES.INVALID_RESPONSE, 'Studio 返回了无法识别的响应', {
+                cause: error,
+                status: response.status,
+              }),
+            );
+            return;
+          }
+          if (response.status < 200 || response.status >= 300) {
+            finish(
+              reject,
+              new AppError(
+                ERROR_CODES.INVALID_INPUT,
+                decoded?.error?.message || options.errorHint || `Studio 拒绝了请求 (${response.status})`,
+                {
+                  status: response.status,
+                  details: decoded?.error?.details,
+                },
+              ),
+            );
+            return;
+          }
+          finish(resolve, decoded.data);
+        },
+        ontimeout() {
+          finish(reject, new AppError(ERROR_CODES.TIMEOUT, '连接 Studio 超时，请确认 Studio 仍在运行'));
+        },
+        onerror() {
+          finish(reject, new AppError(ERROR_CODES.NETWORK_ERROR, options.errorHint || '无法连接本机 Studio'));
+        },
+      });
+      if (options.signal?.aborted) onAbort();
+    } catch (error) {
+      finish(reject, error);
+    }
   });
 }
 
@@ -1809,6 +1911,50 @@ function createRunId(now = new Date()) {
   return `${timestamp}-${suffix}`;
 }
 
+const LOCAL_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+function invalidScope(message) {
+  throw new AppError(ERROR_CODES.INVALID_INPUT, message);
+}
+
+function normalizeDate(value, fieldName) {
+  if (value === undefined || value === null || value === '') return null;
+  const normalized = String(value).trim();
+  const match = normalized.match(LOCAL_DATE_PATTERN);
+  if (!match) invalidScope(`${fieldName}必须使用 YYYY-MM-DD 格式`);
+
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (year === 0) invalidScope(`${fieldName}不是有效日期`);
+  const date = new Date(year, month - 1, day);
+  if (year >= 0 && year < 100) date.setFullYear(year);
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    invalidScope(`${fieldName}不是有效日期`);
+  }
+  return normalized;
+}
+
+function localDateTimestamp(value, endOfDay = false) {
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(
+    year,
+    month - 1,
+    day,
+    endOfDay ? 23 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 59 : 0,
+    endOfDay ? 999 : 0,
+  );
+  if (year >= 0 && year < 100) date.setFullYear(year);
+  return date.getTime() / 1000;
+}
+
 function referencesFromText(text) {
   const pids = [];
   if (!text) return pids;
@@ -1819,19 +1965,42 @@ function referencesFromText(text) {
   return pids;
 }
 
+function normalizeScope(scope) {
+  let bookmarkId = null;
+  let pids = [];
+  let startDate = null;
+  let endDate = null;
+
+  if (scope.type === 'group') {
+    bookmarkId =
+      scope.bookmarkId === undefined || scope.bookmarkId === null
+        ? null
+        : String(scope.bookmarkId).trim() || null;
+    if (!bookmarkId) invalidScope('分组导出必须选择收藏分组');
+  }
+  if (scope.type === 'pids') {
+    pids = Array.isArray(scope.pids) ? [...new Set(scope.pids.map(normalizePid))] : [];
+    if (pids.length === 0) invalidScope('指定 PID 导出至少需要一个 PID');
+  }
+  if (scope.type === 'date') {
+    startDate = normalizeDate(scope.startDate, '开始日期');
+    endDate = normalizeDate(scope.endDate, '结束日期');
+    if (!startDate && !endDate) invalidScope('日期导出至少需要填写开始日期或结束日期');
+    if (startDate && endDate && startDate > endDate) {
+      invalidScope('开始日期不能晚于结束日期');
+    }
+  }
+
+  return { type: scope.type, bookmarkId, pids, startDate, endDate };
+}
+
 function normalizedOptions(options = {}) {
   const scope = options.scope || { type: 'all' };
   if (!['all', 'group', 'pids', 'date'].includes(scope.type)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '未知导出范围');
   }
   return {
-    scope: {
-      type: scope.type,
-      bookmarkId: scope.bookmarkId ? String(scope.bookmarkId) : null,
-      pids: Array.isArray(scope.pids) ? [...new Set(scope.pids.map(normalizePid))] : [],
-      startDate: scope.startDate || null,
-      endDate: scope.endDate || null,
-    },
+    scope: normalizeScope(scope),
     includeComments: options.includeComments !== false,
     includeReadable: options.includeReadable !== false,
     referenceMode: ['none', 'body', 'all'].includes(options.referenceMode)
@@ -1843,8 +2012,8 @@ function normalizedOptions(options = {}) {
 
 function filterByDate(holes, scope) {
   if (scope.type !== 'date') return holes;
-  const start = scope.startDate ? Date.parse(scope.startDate) / 1000 : -Infinity;
-  const end = scope.endDate ? (Date.parse(scope.endDate) + 86_399_999) / 1000 : Infinity;
+  const start = scope.startDate ? localDateTimestamp(scope.startDate) : -Infinity;
+  const end = scope.endDate ? localDateTimestamp(scope.endDate, true) : Infinity;
   return holes.filter((hole) => {
     const timestamp = Number(hole.timestamp);
     return Number.isFinite(timestamp) && timestamp >= start && timestamp <= end;
@@ -1994,14 +2163,14 @@ class ExportJob {
 
   async run(rawOptions = null, { jobId = null, signal: externalSignal } = {}) {
     this.pauseRequested = false;
-    this.controller = new AbortController();
-    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
-    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
-    const signal = this.controller.signal;
-    this.api.scheduler?.resetRateLimitCount?.();
-
     let job = jobId ? await this.store.getJob(jobId) : null;
-    const options = normalizedOptions(rawOptions || job?.options);
+    if (jobId && !job) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '找不到要恢复的导出任务');
+    }
+    if (job && job.type !== 'export') {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '任务类型不是导出任务');
+    }
+    const options = normalizedOptions(job ? job.options : rawOptions);
     if (job && job.accountFingerprint !== this.accountFingerprint) {
       throw new AppError(ERROR_CODES.UNAUTHORIZED, '该断点属于另一个账号，不能恢复');
     }
@@ -2024,6 +2193,11 @@ class ExportJob {
       job.errors = [];
     }
     this.jobId = job.id;
+    this.controller = new AbortController();
+    const onExternalAbort = () => this.controller.abort(externalSignal.reason);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    const signal = this.controller.signal;
+    this.api.scheduler?.resetRateLimitCount?.();
 
     try {
       await this.saveState(job, JOB_STATES.PLANNING);
@@ -2176,6 +2350,15 @@ function importRunId() {
 }
 
 const IMPORTABLE_SOURCES = new Set(['followed', 'explicit', 'legacy-v1']);
+const COMPLETED_IMPORT_STATUSES = new Set([
+  'followed',
+  'followed_reconciled',
+  'already_followed',
+]);
+
+function orderedResults(pids, resultsByPid) {
+  return pids.map((pid) => resultsByPid.get(String(pid))).filter(Boolean);
+}
 
 class ImportJob {
   constructor({ api, store, accountFingerprint, onProgress = () => {} }) {
@@ -2258,6 +2441,7 @@ class ImportJob {
       const alreadyFollowed = [...unique].filter((pid) => followedPids.has(pid));
       const newPids = [...unique].filter((pid) => !followedPids.has(pid));
       return {
+        accountFingerprint: this.accountFingerprint,
         archives,
         allPids: [...unique],
         newPids,
@@ -2274,7 +2458,26 @@ class ImportJob {
   }
 
   async execute(preview, { signal: externalSignal, jobId = null } = {}) {
-    if (!preview || preview.remoteComplete !== true) {
+    const storedJob = jobId ? await this.store.getJob(jobId) : null;
+    if (jobId && !storedJob) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '找不到要恢复的导入任务');
+    }
+    if (storedJob && storedJob.type !== 'import') {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '任务类型不是导入任务');
+    }
+    if (storedJob && storedJob.accountFingerprint !== this.accountFingerprint) {
+      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该导入断点属于另一个账号');
+    }
+    const effectivePreview = storedJob?.preview || preview;
+    const previewAccountFingerprint =
+      effectivePreview?.accountFingerprint || storedJob?.accountFingerprint;
+    if (previewAccountFingerprint !== this.accountFingerprint) {
+      throw new AppError(
+        ERROR_CODES.UNAUTHORIZED,
+        '预检账号与当前账号不一致，请重新预检后再导入',
+      );
+    }
+    if (!effectivePreview || effectivePreview.remoteComplete !== true) {
       throw new AppError(
         ERROR_CODES.INVALID_RESPONSE,
         '当前关注列表读取不完整，已禁止导入；请重新预检后再试',
@@ -2287,10 +2490,7 @@ class ImportJob {
     const signal = this.controller.signal;
     this.api.scheduler?.resetRateLimitCount?.();
 
-    let job = jobId ? await this.store.getJob(jobId) : null;
-    if (job && job.accountFingerprint !== this.accountFingerprint) {
-      throw new AppError(ERROR_CODES.UNAUTHORIZED, '该导入断点属于另一个账号');
-    }
+    let job = storedJob;
     if (!job) {
       job = {
         id: importRunId(),
@@ -2298,38 +2498,54 @@ class ImportJob {
         state: JOB_STATES.PLANNING,
         createdAt: Date.now(),
         accountFingerprint: this.accountFingerprint,
-        pids: preview.newPids,
+        pids: effectivePreview.newPids,
         preview: {
-          archives: preview.archives,
-          allPids: preview.allPids,
-          newPids: preview.newPids,
-          alreadyFollowed: preview.alreadyFollowed,
-          duplicateCount: preview.duplicateCount,
-          excludedReferenced: preview.excludedReferenced,
-          invalidFiles: preview.invalidFiles,
-          remoteComplete: preview.remoteComplete,
+          accountFingerprint: effectivePreview.accountFingerprint,
+          archives: effectivePreview.archives,
+          allPids: effectivePreview.allPids,
+          newPids: effectivePreview.newPids,
+          alreadyFollowed: effectivePreview.alreadyFollowed,
+          duplicateCount: effectivePreview.duplicateCount,
+          excludedReferenced: effectivePreview.excludedReferenced,
+          invalidFiles: effectivePreview.invalidFiles,
+          remoteComplete: effectivePreview.remoteComplete,
         },
-        total: preview.newPids.length,
+        total: effectivePreview.newPids.length,
         completed: 0,
         results: [],
       };
     }
     this.jobId = job.id;
-    await this.store.putJob({ ...job, state: JOB_STATES.RUNNING });
+    job.state = JOB_STATES.RUNNING;
+    delete job.audit;
+    delete job.fatalError;
     const previous = await this.store.getItems(job.id);
-    const completedPids = new Set(previous.map((result) => result.pid));
-    const results = [...previous];
+    const jobPids = new Set(job.pids.map(String));
+    const resultsByPid = new Map(
+      previous
+        .filter((result) => jobPids.has(String(result.pid)))
+        .map((result) => [String(result.pid), result]),
+    );
+    job.completed = resultsByPid.size;
+    job.results = orderedResults(job.pids, resultsByPid);
+    await this.store.putJob(job);
 
     try {
       for (const pid of job.pids) {
         throwIfAborted(signal, 'import');
         if (this.pauseRequested) {
           job.state = JOB_STATES.PAUSED;
-          job.results = results;
+          job.results = orderedResults(job.pids, resultsByPid);
+          job.completed = job.results.length;
           await this.store.putJob(job);
-          return { job, paused: true, audit: this.buildAudit(preview, results) };
+          return {
+            job,
+            paused: true,
+            audit: this.buildAudit(effectivePreview, job.results),
+          };
         }
-        if (completedPids.has(pid)) continue;
+        const previousResult = resultsByPid.get(String(pid));
+        if (COMPLETED_IMPORT_STATUSES.has(previousResult?.status)) continue;
         let result;
         try {
           const response = await this.api.followHole(pid, signal);
@@ -2342,17 +2558,24 @@ class ImportJob {
           ) {
             throw error;
           }
-          result = { pid, status: 'failed', error: toErrorRecord(error) };
+          const errorRecord = toErrorRecord(error);
+          result = {
+            pid,
+            status: errorRecord.code === ERROR_CODES.UNKNOWN_RESULT ? 'unknown' : 'failed',
+            error: errorRecord,
+          };
         }
-        results.push(result);
-        completedPids.add(pid);
+        resultsByPid.set(String(pid), result);
         await this.store.putItem(job.id, pid, result);
-        job.completed = completedPids.size;
-        job.results = results;
+        job.completed = resultsByPid.size;
+        job.results = orderedResults(job.pids, resultsByPid);
         await this.store.putJob(job);
         this.onProgress({ ...job, type: 'progress', pid });
       }
-      const audit = this.buildAudit(preview, results);
+      const results = orderedResults(job.pids, resultsByPid);
+      const audit = this.buildAudit(effectivePreview, results);
+      job.completed = results.length;
+      job.results = results;
       job.state = audit.failed === 0 && audit.unknown === 0 ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL;
       job.audit = audit;
       await this.store.putJob(job);
@@ -2383,8 +2606,14 @@ class ImportJob {
       followed: count(['followed', 'followed_reconciled']),
       skipped: count(['already_followed']),
       notFound: results.filter((result) => result.error?.code === ERROR_CODES.NOT_FOUND).length,
-      unknown: results.filter((result) => result.error?.code === ERROR_CODES.UNKNOWN_RESULT).length,
-      failed: count(['failed']),
+      unknown: results.filter(
+        (result) =>
+          result.status === 'unknown' || result.error?.code === ERROR_CODES.UNKNOWN_RESULT,
+      ).length,
+      failed: results.filter(
+        (result) =>
+          result.status === 'failed' && result.error?.code !== ERROR_CODES.UNKNOWN_RESULT,
+      ).length,
       results,
     };
   }
@@ -2489,6 +2718,64 @@ function ensureEntryBeforeAnchor(entry, anchor) {
   if (entry.parentNode === anchor.parentNode && entry.nextSibling === anchor) return false;
   anchor.parentNode.insertBefore(entry, anchor);
   return true;
+}
+
+function selectLatestResumableJob(jobs, accountFingerprint) {
+  return [...(jobs || [])]
+    .filter(
+      (job) =>
+        job.accountFingerprint === accountFingerprint &&
+        ['planning', 'running', 'paused', 'partial'].includes(job.state),
+    )
+    .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))[0] || null;
+}
+
+function createResumableJobDiscovery({ isBusy, discover }) {
+  let inFlight = null;
+  return function discoverOnce() {
+    if (isBusy()) return Promise.resolve(null);
+    if (!inFlight) {
+      const pending = Promise.resolve()
+        .then(() => (isBusy() ? null : discover()))
+        .finally(() => {
+          if (inFlight === pending) inFlight = null;
+        });
+      inFlight = pending;
+    }
+    return inFlight;
+  };
+}
+
+function reconcileAccountScopedState(state, accountFingerprint) {
+  const accountChanged = Boolean(
+    state.accountFingerprint &&
+    accountFingerprint &&
+    state.accountFingerprint !== accountFingerprint,
+  );
+  return {
+    ...state,
+    accountFingerprint,
+    accountChanged,
+    ...(accountChanged
+      ? {
+          lastArchive: null,
+          lastExportOptions: null,
+          activeJobId: null,
+          activeKind: null,
+          importPreview: null,
+        }
+      : {}),
+  };
+}
+
+function apiForAccount(api, accountFingerprint) {
+  return typeof api?.forAccount === 'function' ? api.forAccount(accountFingerprint) : api;
+}
+
+async function abortAndWaitForPairingWatch(watch) {
+  if (!watch) return;
+  watch.controller.abort();
+  await watch.promise;
 }
 
 const PANEL_STYLES = `
@@ -2649,6 +2936,7 @@ function mountToolkit({
   let pairingWatch = null;
   let isRunning = false;
   let bookmarksLoaded = false;
+  let loadedAccountFingerprint = null;
   const mountedAt = Date.now();
   const studioBridgeStorage = createStudioBridgeStorage();
   let preferenceStorage = null;
@@ -2744,6 +3032,42 @@ function mountToolkit({
       importPreview.newPids?.length === 0;
   }
 
+  function useAccountFingerprint(accountFingerprint) {
+    const next = reconcileAccountScopedState(
+      {
+        accountFingerprint: loadedAccountFingerprint,
+        lastArchive,
+        lastExportOptions,
+        activeJobId,
+        activeKind,
+        importPreview,
+      },
+      accountFingerprint,
+    );
+    loadedAccountFingerprint = next.accountFingerprint;
+    if (!next.accountChanged) return false;
+    lastArchive = next.lastArchive;
+    lastExportOptions = next.lastExportOptions;
+    activeJobId = next.activeJobId;
+    activeKind = next.activeKind;
+    importPreview = next.importPreview;
+    bookmarksLoaded = false;
+    $('#bookmark').replaceChildren();
+    const previewElement = $('[data-import-preview]');
+    previewElement.hidden = true;
+    previewElement.textContent = '';
+    setRunning(isRunning);
+    return true;
+  }
+
+  async function credentialsForCurrentAccount() {
+    const credentials = await credentialsProvider();
+    return {
+      credentials,
+      accountChanged: useAccountFingerprint(credentials.accountFingerprint),
+    };
+  }
+
   function renderStudioBridgeState() {
     const state = studioBridgeState;
     if (state?.status === 'paired') {
@@ -2777,10 +3101,11 @@ function mountToolkit({
   }
 
   async function ensureBookmarks() {
-    if (bookmarksLoaded) return;
     const select = $('#bookmark');
     try {
-      const bookmarks = await api.listBookmarks();
+      const { credentials } = await credentialsForCurrentAccount();
+      if (bookmarksLoaded) return;
+      const bookmarks = await apiForAccount(api, credentials.accountFingerprint).listBookmarks();
       select.replaceChildren(
         ...bookmarks.map((bookmark) => {
           const option = documentObject.createElement('option');
@@ -2806,48 +3131,47 @@ function mountToolkit({
     }
   }
 
-  async function discoverResumableJob() {
-    try {
-      const credentials = await credentialsProvider();
-      const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
-      if (restored) {
-        lastArchive = restored.archive;
-        lastExportOptions = restored.job.options;
+  const discoverResumableJob = createResumableJobDiscovery({
+    isBusy: () => Boolean(activeJob || isRunning),
+    async discover() {
+      try {
+        const { credentials } = await credentialsForCurrentAccount();
+        if (activeJob || isRunning) return null;
+        const [restored, jobs] = await Promise.all([
+          restoreLatestExportArchive(store, credentials.accountFingerprint),
+          store.listJobs(),
+        ]);
+        if (activeJob || isRunning) return null;
+        if (restored) {
+          lastArchive = restored.archive;
+          lastExportOptions = restored.job.options;
+        }
+        let job = selectLatestResumableJob(jobs, credentials.accountFingerprint);
+        if (!job) {
+          setRunning(false);
+          if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
+          return null;
+        }
+        if (['planning', 'running'].includes(job.state)) {
+          job = { ...job, state: 'paused' };
+          await store.putJob(job);
+          if (activeJob || isRunning) return null;
+        }
+        activeJobId = job.id;
+        activeKind = job.type;
+        if (job.type === 'export') lastExportOptions = job.options;
+        if (job.type === 'import') importPreview = job.preview;
+        statusLabel.textContent = 'paused';
+        countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
+        setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
         setRunning(false);
+        return job;
+      } catch (error) {
+        if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
+        return null;
       }
-      const jobs = (await store.listJobs())
-        .filter(
-          (job) =>
-            job.accountFingerprint === credentials.accountFingerprint &&
-            ['running', 'paused', 'partial'].includes(job.state),
-        )
-        .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0));
-      const job = jobs[0];
-      if (!job) {
-        if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
-        return;
-      }
-      activeJobId = job.id;
-      activeKind = job.type;
-      if (job.type === 'export') lastExportOptions = job.options;
-      if (job.type === 'import') importPreview = job.preview;
-      if (job.state === 'running') {
-        job.state = 'paused';
-        await store.putJob(job);
-      }
-      statusLabel.textContent = 'paused';
-      countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
-      setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
-      resumeButton.disabled = false;
-      retryButton.disabled = false;
-      importExecuteButton.disabled = !importPreview;
-      if (importPreview?.remoteComplete !== true || importPreview?.newPids?.length === 0) {
-        importExecuteButton.disabled = true;
-      }
-    } catch (error) {
-      if (error.code !== ERROR_CODES.UNAUTHORIZED) console.warn('[PKU Hole Toolkit]', error);
-    }
-  }
+    },
+  });
 
   function exportOptions() {
     const type = $('#scope').value;
@@ -2925,14 +3249,25 @@ function mountToolkit({
       setMessage('当前只选择了发送 Studio，请先关联本机 Studio；也可以同时选择下载到本机', true);
       return;
     }
+    if (!jobId) {
+      activeJobId = null;
+      activeKind = null;
+    }
     setRunning(true);
     setMessage('正在规划导出范围…');
     statusLabel.textContent = 'planning';
     try {
-      const credentials = await credentialsProvider();
+      const { credentials, accountChanged } = await credentialsForCurrentAccount();
+      if (accountChanged && jobId) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '账号已切换，不能恢复旧账号的导出任务');
+      }
+      if (accountChanged && options?.scope?.type === 'group') {
+        await ensureBookmarks();
+        throw new AppError(ERROR_CODES.INVALID_INPUT, '账号已切换，请重新选择收藏分组');
+      }
       activeKind = 'export';
       activeJob = new ExportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -2971,16 +3306,18 @@ function mountToolkit({
   async function previewImport() {
     const files = [...$('#archive-files').files];
     if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
+    activeJobId = null;
+    activeKind = null;
     setRunning(true);
     statusLabel.textContent = 'previewing';
     countLabel.textContent = '0 / ?';
     progress.removeAttribute('value');
     setMessage('正在解析归档并读取当前关注列表；关注较多时可能需要几十秒…');
     try {
-      const credentials = await credentialsProvider();
+      const { credentials } = await credentialsForCurrentAccount();
       activeKind = 'import';
       activeJob = new ImportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -3016,20 +3353,24 @@ function mountToolkit({
   }
 
   async function executeImport(jobId = null) {
-    if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
-    if (
-      !windowObject.confirm(
-        `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
-      )
-    ) {
-      return;
-    }
     setRunning(true);
     try {
-      const credentials = await credentialsProvider();
+      const { credentials, accountChanged } = await credentialsForCurrentAccount();
+      if (accountChanged) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '账号已切换，请在当前账号重新预检');
+      }
+      if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
+      if (
+        !windowObject.confirm(
+          `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
+        )
+      ) {
+        return;
+      }
+      if (!jobId) activeJobId = null;
       activeKind = 'import';
       activeJob = new ImportJob({
-        api,
+        api: apiForAccount(api, credentials.accountFingerprint),
         store,
         accountFingerprint: credentials.accountFingerprint,
         onProgress: handleProgress,
@@ -3062,11 +3403,12 @@ function mountToolkit({
   }
 
   async function refreshStudioConnection() {
+    if (pairingWatch && studioBridgeState?.status === 'pending') {
+      renderStudioBridgeState();
+      return studioBridgeState;
+    }
     try {
       studioBridgeState = await studioBridgeStorage.get();
-      if (studioBridgeState?.status === 'pending') {
-        studioBridgeState = await refreshStudioDevicePairing({ state: studioBridgeState, storage: studioBridgeStorage });
-      }
     } catch (error) {
       if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) studioBridgeState = null;
       else throw error;
@@ -3076,30 +3418,60 @@ function mountToolkit({
     return studioBridgeState;
   }
 
+  async function cancelStudioPairingWatch() {
+    const watch = pairingWatch;
+    if (!watch) return;
+    pairingWatch = null;
+    await abortAndWaitForPairingWatch(watch);
+  }
+
   function watchStudioPairing(state) {
     if (pairingWatch || state?.status !== 'pending') return;
-    pairingWatch = waitForStudioDevicePairing({
+    const Controller = windowObject.AbortController || globalThis.AbortController;
+    const watch = {
+      controller: new Controller(),
+      requestToken: state.requestToken,
+      promise: null,
+    };
+    pairingWatch = watch;
+    watch.promise = waitForStudioDevicePairing({
       state,
       storage: studioBridgeStorage,
+      signal: watch.controller.signal,
       onUpdate(next) {
+        if (
+          pairingWatch !== watch ||
+          watch.controller.signal.aborted ||
+          (next?.status === 'pending' && next.requestToken !== watch.requestToken)
+        ) {
+          return;
+        }
         studioBridgeState = next;
         renderStudioBridgeState();
       },
     })
       .then((paired) => {
+        if (pairingWatch !== watch || watch.controller.signal.aborted) return;
         studioBridgeState = paired;
         renderStudioBridgeState();
         statusLabel.textContent = 'studio_paired';
         setMessage('Studio 关联成功。今后可直接发送，不再复制接收码。');
       })
       .catch((error) => {
+        if (
+          pairingWatch !== watch ||
+          watch.controller.signal.aborted ||
+          error.code === ERROR_CODES.CANCELLED
+        ) {
+          return;
+        }
         studioBridgeState = null;
         renderStudioBridgeState();
         statusLabel.textContent = 'failed';
         setMessage(error.message || 'Studio 关联失败', true);
       })
       .finally(() => {
-        pairingWatch = null;
+        if (pairingWatch === watch) pairingWatch = null;
       });
   }
 
@@ -3109,6 +3481,17 @@ function mountToolkit({
     statusLabel.textContent = 'pairing_studio';
     setMessage('正在向本机 Studio 发起关联请求…');
     try {
+      await cancelStudioPairingWatch();
+      const previous = await studioBridgeStorage.get();
+      if (previous?.status === 'paired') {
+        studioBridgeState = previous;
+        renderStudioBridgeState();
+        setMessage('Studio 已完成关联，无需重新发起。');
+        return;
+      }
+      if (previous?.status === 'pending') await studioBridgeStorage.delete();
+      studioBridgeState = null;
+      renderStudioBridgeState();
       studioBridgeState = await requestStudioDevicePairing({ port, storage: studioBridgeStorage });
       renderStudioBridgeState();
       const studioURL = `http://127.0.0.1:${studioBridgeState.port}/imports?view=bridge`;
@@ -3124,17 +3507,21 @@ function mountToolkit({
   }
 
   async function sendToTrustedStudio() {
-    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
-    if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在签名并把归档发送到已关联 Studio…');
     try {
+      await credentialsForCurrentAccount();
+      if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+      if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
       const result = await sendArchiveToTrustedStudio(lastArchive, { state: studioBridgeState, storage: studioBridgeStorage });
       statusLabel.textContent = 'awaiting_confirmation';
       setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
     } catch (error) {
-      if (error.status === 404 || error.code === ERROR_CODES.UNAUTHORIZED) {
+      if (
+        error.status === 404 ||
+        (error.code === ERROR_CODES.UNAUTHORIZED && error.operation !== 'credentials')
+      ) {
         await studioBridgeStorage.delete();
         studioBridgeState = null;
         renderStudioBridgeState();
@@ -3147,12 +3534,13 @@ function mountToolkit({
   }
 
   async function forgetStudioConnection() {
-    const previous = studioBridgeState;
     setRunning(true);
     try {
-      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
+      await cancelStudioPairingWatch();
+      const previous = (await studioBridgeStorage.get()) || studioBridgeState;
       studioBridgeState = null;
       renderStudioBridgeState();
+      const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
       setMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地关联请求。');
     } catch (error) {
       studioBridgeState = null;
@@ -3164,13 +3552,14 @@ function mountToolkit({
   }
 
   async function sendToStudioWithCode() {
-    if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
-    const code = $('#studio-pairing-code').value.trim();
-    if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
     setRunning(true);
     statusLabel.textContent = 'sending';
     setMessage('正在把归档发送到本机 Studio…');
     try {
+      await credentialsForCurrentAccount();
+      if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
+      const code = $('#studio-pairing-code').value.trim();
+      if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
       const result = await sendArchiveToStudio(code, lastArchive);
       statusLabel.textContent = 'awaiting_confirmation';
       setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
@@ -3183,7 +3572,8 @@ function mountToolkit({
     }
   }
 
-  function downloadLastExport() {
+  async function downloadLastExport() {
+    await credentialsForCurrentAccount();
     if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有可重新下载的完成归档');
     downloadBlob(documentObject, lastArchive.blob, lastArchive.filename);
     setMessage(`已重新下载 ${lastArchive.filename}`);
@@ -3254,20 +3644,21 @@ function mountToolkit({
       })
       .catch((error) => setMessage(error.message || '检查 Studio 关联失败', true)),
   );
-  lastExportDownloadButton.addEventListener('click', () => {
-    try {
-      downloadLastExport();
-    } catch (error) {
-      setMessage(error.message, true);
-    }
-  });
+  lastExportDownloadButton.addEventListener('click', () =>
+    downloadLastExport().catch((error) => setMessage(error.message, true)),
+  );
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
       statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
       setMessage(error.message, true);
     }),
   );
-  importExecuteButton.addEventListener('click', () => executeImport());
+  importExecuteButton.addEventListener('click', () =>
+    executeImport().catch((error) => {
+      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setMessage(error.message, true);
+    }),
+  );
   pauseButton.addEventListener('click', () => {
     activeJob?.requestPause();
     setMessage('将在当前洞处理完成后暂停…');
@@ -3309,6 +3700,7 @@ function mountToolkit({
     close: closePanel,
     destroy() {
       clearTimeout(fallbackTimer);
+      void cancelStudioPairingWatch();
       observer.disconnect();
       entry.remove();
       host.remove();
@@ -3323,26 +3715,44 @@ function mountToolkit({
 
 
 // ---- main.js ----
+function createCredentialsProvider({
+  documentObject = globalThis.document,
+  storage = globalThis.localStorage,
+  cryptoObject = globalThis.crypto,
+} = {}) {
+  let cachedKey = null;
+  let credentialsPromise = null;
+
+  return () => {
+    const token = parseCookieString(documentObject?.cookie || '').pku_token || '';
+    const uuid = storage?.getItem?.('pku-uuid') || '';
+    const currentKey = `${token.length}:${token}\n${uuid.length}:${uuid}`;
+    if (!credentialsPromise || currentKey !== cachedKey) {
+      cachedKey = currentKey;
+      const guarded = getCredentials({ documentObject, storage, cryptoObject }).catch((error) => {
+        if (credentialsPromise === guarded) {
+          credentialsPromise = null;
+          cachedKey = null;
+        }
+        throw error;
+      });
+      credentialsPromise = guarded;
+    }
+    return credentialsPromise;
+  };
+}
+
 function startToolkit({
   documentObject = globalThis.document,
   windowObject = globalThis.window,
   fetchImpl = globalThis.fetch?.bind(globalThis),
   indexedDBObject = globalThis.indexedDB,
 } = {}) {
-  let credentialsPromise = null;
-  const credentialsProvider = () => {
-    if (!credentialsPromise) {
-      credentialsPromise = getCredentials({
-        documentObject,
-        storage: windowObject.localStorage,
-        cryptoObject: windowObject.crypto,
-      }).catch((error) => {
-        credentialsPromise = null;
-        throw error;
-      });
-    }
-    return credentialsPromise;
-  };
+  const credentialsProvider = createCredentialsProvider({
+    documentObject,
+    storage: windowObject.localStorage,
+    cryptoObject: windowObject.crypto,
+  });
   const scheduler = new RequestScheduler({ fetchImpl });
   const api = new TreeholeApi({ scheduler, credentialsProvider });
   const store = new JobStore({ indexedDBObject });
