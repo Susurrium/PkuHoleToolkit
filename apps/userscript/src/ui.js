@@ -150,55 +150,144 @@ export async function abortAndWaitForPairingWatch(watch) {
   await watch.promise;
 }
 
+export function taskStatusText(state, kind = 'export') {
+  const labels = {
+    planning: '正在读取备份范围',
+    running: kind === 'import' ? '正在新增关注' : '正在生成备份',
+    previewing: '正在检查备份',
+    previewed: '检查完成',
+    paused: '任务已暂停',
+    partial: '部分完成',
+    completed: kind === 'import' ? '迁移完成' : '备份完成',
+    failed: '任务未完成',
+    cancelled: '任务已取消',
+  };
+  return labels[state] || '正在处理';
+}
+
+export function exportSummaryText(options = {}) {
+  const scopeLabels = {
+    all: '全部关注',
+    group: '收藏分组',
+    pids: '指定帖子',
+    date: '按帖子发布日期',
+  };
+  const parts = [scopeLabels[options.scope?.type] || '全部关注'];
+  parts.push(options.includeComments === false ? '不含评论' : '包含评论');
+  if (options.referenceMode === 'body') parts.push('补全正文引用');
+  else if (options.referenceMode === 'all') parts.push('补全正文和评论引用');
+  else parts.push('不补全引用');
+  if (options.includeReadable !== false) parts.push('附带阅读版');
+  return parts.join(' · ');
+}
+
 const PANEL_STYLES = `
   :host { all: initial; color-scheme: light dark; }
   * { box-sizing: border-box; }
-  .overlay { position: fixed; inset: 0; z-index: 2147483646; display: none; place-items: center; padding: 20px; background: rgba(0,0,0,.5); font-family: system-ui, -apple-system, sans-serif; color: #202124; }
+  .overlay { position: fixed; inset: 0; z-index: 2147483646; display: none; place-items: center; padding: 20px; background: rgba(15,23,42,.56); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; }
   .overlay.open { display: grid; }
-  .panel { width: min(720px, 100%); max-height: min(820px, calc(100vh - 40px)); overflow: auto; border-radius: 14px; background: #fff; box-shadow: 0 24px 80px rgba(0,0,0,.32); }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid #e6e8eb; }
-  h2 { margin: 0; font-size: 20px; }
-  h3 { margin: 0 0 12px; font-size: 16px; }
-  .close { border: 0; background: transparent; font-size: 26px; line-height: 1; cursor: pointer; color: inherit; }
-  .tabs { display: flex; gap: 6px; padding: 12px 20px 0; }
-  .tabs button { flex: 1; }
-  main { padding: 18px 20px 22px; }
-  section[hidden], .conditional[hidden] { display: none; }
+  .panel { width: min(680px, 100%); max-height: min(840px, calc(100vh - 40px)); overflow: auto; border: 1px solid rgba(148,163,184,.28); border-radius: 18px; background: #fff; box-shadow: 0 28px 90px rgba(15,23,42,.34); }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; }
+  h2 { margin: 0; font-size: 21px; letter-spacing: -.01em; }
+  h3 { margin: 0 0 10px; font-size: 16px; }
+  p { line-height: 1.6; }
+  .subtitle { margin: 6px 0 0; color: #596579; font-size: 13px; }
+  .close { min-width: 36px; border: 0; background: transparent; font-size: 26px; line-height: 1; cursor: pointer; color: inherit; }
+  .tabs { display: flex; gap: 6px; margin: 0 24px; padding: 4px; border-radius: 11px; background: #f1f5f9; }
+  .tabs button { flex: 1; border-color: transparent; background: transparent; color: #526176; font-weight: 650; }
+  .tabs button[aria-selected="true"] { border-color: #cbdcf8; background: #fff; color: #1458b3; box-shadow: 0 1px 4px rgba(15,23,42,.1); }
+  main { padding: 20px 24px 26px; }
+  section[hidden], .conditional[hidden], [hidden] { display: none !important; }
+  .intro { margin: 0 0 18px; padding: 12px 14px; border: 1px solid #dbeafe; border-radius: 10px; background: #f5f9ff; color: #41536b; font-size: 13px; }
+  .section-title { margin: 20px 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
   .field { display: grid; gap: 6px; }
   .field.full { grid-column: 1 / -1; }
   label, legend { font-size: 14px; font-weight: 600; }
   input, select, textarea, button { font: inherit; }
-  input, select, textarea { width: 100%; border: 1px solid #b8bec7; border-radius: 8px; padding: 9px 10px; background: #fff; color: #202124; }
+  input, select, textarea { width: 100%; border: 1px solid #b7c0ce; border-radius: 9px; padding: 10px 11px; background: #fff; color: #172033; }
   textarea { min-height: 80px; resize: vertical; }
   .checks { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 14px 0; }
   .checks label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
   .checks input { width: auto; }
-  fieldset { min-width: 0; margin: 16px 0 0; padding: 14px; border: 1px solid #d7dbe1; border-radius: 10px; }
+  fieldset { min-width: 0; margin: 14px 0 0; padding: 14px; border: 1px solid #d7dbe1; border-radius: 10px; }
   fieldset legend { padding: 0 6px; }
   .hint { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: #68707c; }
-  button { border: 1px solid #aeb4bd; border-radius: 8px; padding: 9px 14px; background: #f7f8fa; color: #202124; cursor: pointer; }
-  button.primary { border-color: #1a73e8; background: #1a73e8; color: #fff; }
+  button { border: 1px solid #aeb8c6; border-radius: 9px; padding: 9px 14px; background: #f8fafc; color: #172033; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #7b8aa0; background: #f1f5f9; }
+  button.primary { min-height: 42px; border-color: #1768d5; background: #1768d5; color: #fff; font-weight: 700; }
+  button.primary:hover:not(:disabled) { border-color: #0f56b5; background: #0f56b5; }
   button.danger { border-color: #c5221f; color: #c5221f; }
+  button.quiet { border-color: transparent; background: transparent; color: #53647b; }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid rgba(26,115,232,.35); outline-offset: 2px; }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid rgba(26,115,232,.35); outline-offset: 2px; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-  .status-card { margin-top: 18px; padding: 14px; border-radius: 10px; background: #f2f6fc; border: 1px solid #dce6f5; }
+  .primary-actions .primary { flex: 1; }
+  .summary-line { margin: 12px 0 0; color: #526176; font-size: 13px; }
+  details.disclosure { margin-top: 14px; border: 1px solid #d9e0e9; border-radius: 10px; background: #fbfcfe; }
+  details.disclosure > summary { cursor: pointer; list-style-position: inside; padding: 12px 14px; font-size: 14px; font-weight: 650; }
+  details.disclosure[open] > summary { border-bottom: 1px solid #e2e7ee; }
+  .disclosure-body { padding: 2px 14px 14px; }
+  .status-card { margin: 0 0 18px; padding: 14px; border-radius: 11px; background: #f4f8fe; border: 1px solid #d7e4f5; }
+  .status-card.warning { background: #fff9eb; border-color: #f3d58b; }
   .status-line { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
   progress { width: 100%; height: 12px; margin: 10px 0; }
-  .message { min-height: 1.5em; margin: 8px 0 0; white-space: pre-wrap; font-size: 14px; }
+  .message { margin: 8px 0 0; white-space: pre-wrap; font-size: 14px; }
   .message.error { color: #b3261e; }
-  .preview { margin-top: 14px; padding: 12px; border: 1px solid #d7dbe1; border-radius: 8px; white-space: pre-wrap; font-size: 14px; }
-  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .field.full { grid-column: auto; } }
+  .result-card { margin-top: 18px; padding: 16px; border: 1px solid #cce7d7; border-radius: 11px; background: #f3fbf6; }
+  .result-card h3 { color: #17663b; }
+  .result-card .message { color: #405247; }
+  .filename { overflow-wrap: anywhere; color: #68707c; font-size: 12px; }
+  .preview { margin-top: 16px; padding: 16px; border: 1px solid #d7dbe1; border-radius: 10px; font-size: 14px; }
+  .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
+  .metric { padding: 12px; border-radius: 9px; background: #f4f7fb; }
+  .metric strong { display: block; margin-bottom: 4px; color: #155bb7; font-size: 24px; }
+  .metric span { color: #5d6979; font-size: 12px; }
+  .studio-section { margin-top: 22px !important; }
+  .studio-summary { display: inline-flex; align-items: center; justify-content: space-between; width: calc(100% - 22px); gap: 10px; }
+  .badge { flex: 0 0 auto; padding: 2px 8px; border-radius: 999px; background: #e8edf3; color: #5d6979; font-size: 11px; font-weight: 650; white-space: nowrap; }
+  .badge.connected { background: #dff5e8; color: #17663b; }
+  .studio-options { margin: 12px 0 0; padding: 11px 12px; border-radius: 9px; background: #eef7ff; }
+  .studio-options label { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+  .studio-options input { width: auto; }
+  .nested { margin-top: 14px; }
+  .nested summary { cursor: pointer; color: #53647b; font-size: 13px; }
+  .step-label { margin: 18px 0 8px; color: #526176; font-size: 12px; font-weight: 750; letter-spacing: .04em; text-transform: uppercase; }
+  @media (max-width: 600px) {
+    .overlay { align-items: stretch; padding: 0; }
+    .panel { width: 100%; max-height: 100vh; border: 0; border-radius: 0; }
+    header { padding: 18px 16px 14px; }
+    .tabs { margin-inline: 16px; }
+    main { padding: 18px 16px 22px; }
+    .grid, .metrics { grid-template-columns: 1fr; }
+    .field.full { grid-column: auto; }
+    .actions { flex-direction: column; }
+    .actions button { width: 100%; }
+  }
   @media (prefers-color-scheme: dark) {
     .overlay { color: #e8eaed; }
-    .panel { background: #202124; }
-    header { border-color: #3c4043; }
+    .panel { background: #1f2329; border-color: #3d4652; }
+    .subtitle, .summary-line, .filename, .step-label { color: #b6c0ce; }
+    .tabs { background: #292f38; }
+    .tabs button[aria-selected="true"] { border-color: #46566b; background: #394352; color: #b9d6ff; }
+    .intro { border-color: #3c526e; background: #26384d; color: #d5e4f7; }
     input, select, textarea { background: #292a2d; border-color: #5f6368; color: #e8eaed; }
     button { background: #303134; border-color: #5f6368; color: #e8eaed; }
     button.primary { background: #8ab4f8; border-color: #8ab4f8; color: #202124; }
-    .status-card { background: #263248; border-color: #3b4e6d; }
-    .preview, fieldset { border-color: #5f6368; }
+    .status-card { background: #26364a; border-color: #40536d; }
+    .status-card.warning { background: #463b24; border-color: #735f2e; }
+    .result-card { background: #22382d; border-color: #39654c; }
+    .result-card h3 { color: #91d5aa; }
+    .result-card .message { color: #d2dfd6; }
+    .preview, fieldset, details.disclosure { border-color: #505966; }
+    details.disclosure { background: #252a31; }
+    details.disclosure[open] > summary { border-color: #424a55; }
+    .metric { background: #2b323c; }
+    .metric strong { color: #9bc5ff; }
+    .metric span { color: #bdc7d4; }
+    .studio-options { background: #26384d; }
+    .badge { background: #3b4450; color: #c3ccd8; }
+    .badge.connected { background: #284b36; color: #9bd5ad; }
     .hint { color: #bdc1c6; }
   }
 `;
@@ -207,61 +296,103 @@ function panelTemplate() {
   return `
     <style>${PANEL_STYLES}</style>
     <div class="overlay" aria-hidden="true">
-      <div class="panel" role="dialog" aria-modal="true" aria-labelledby="toolkit-title">
-        <header><h2 id="toolkit-title">北大树洞归档与迁移</h2><button class="close" type="button" aria-label="关闭">×</button></header>
+      <div class="panel" role="dialog" aria-modal="true" aria-labelledby="toolkit-title" aria-describedby="toolkit-subtitle">
+        <header>
+          <div><h2 id="toolkit-title">北大树洞备份工具</h2><p class="subtitle" id="toolkit-subtitle">独立保存关注内容，也可从备份迁移关注</p></div>
+          <button class="close" type="button" aria-label="关闭">×</button>
+        </header>
         <div class="tabs" role="tablist">
-          <button type="button" role="tab" data-tab="export" aria-selected="true">导出归档</button>
-          <button type="button" role="tab" data-tab="import" aria-selected="false">导入关注</button>
+          <button id="tab-export" type="button" role="tab" data-tab="export" aria-controls="panel-export" aria-selected="true">备份到本机</button>
+          <button id="tab-import" type="button" role="tab" data-tab="import" aria-controls="panel-import" aria-selected="false">迁移关注</button>
         </div>
         <main>
-          <section data-panel="export">
-            <h3>导出设置</h3>
-            <div class="grid">
-              <div class="field"><label for="scope">范围</label><select id="scope"><option value="all">全部关注</option><option value="group">收藏分组</option><option value="pids">指定 PID</option><option value="date">日期范围</option></select></div>
-              <div class="field conditional" data-for-scope="group" hidden><label for="bookmark">收藏分组</label><select id="bookmark"><option value="">正在加载分组…</option></select></div>
-              <div class="field full conditional" data-for-scope="pids" hidden><label for="export-pids">PID（空格、逗号或换行分隔）</label><textarea id="export-pids" placeholder="123456 234567"></textarea></div>
-              <div class="field conditional" data-for-scope="date" hidden><label for="start-date">开始日期</label><input id="start-date" type="date"></div>
-              <div class="field conditional" data-for-scope="date" hidden><label for="end-date">结束日期</label><input id="end-date" type="date"></div>
-              <div class="field"><label for="reference-mode">引用洞</label><select id="reference-mode"><option value="none">不抓取</option><option value="body">仅正文引用</option><option value="all">正文和评论引用</option></select></div>
-            </div>
-            <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>包含 readable.txt</label></div>
-            <fieldset>
-              <legend>归档生成后</legend>
-              <div class="checks">
-                <label><input id="delivery-download" type="checkbox">下载归档到本机</label>
-                <label><input id="delivery-studio" type="checkbox">发送到已关联 Studio</label>
-              </div>
-              <p class="hint">可以同时选择。两种输出复用同一份归档；未选择 Studio 时不会连接本机端口。</p>
-            </fieldset>
-            <div class="actions"><button class="primary" type="button" data-action="export">开始生成归档</button></div>
-            <div class="status-card">
-              <h3>发送到 PkuHoleStudio</h3>
-              <p class="message" data-studio-connection>尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。</p>
-              <div class="grid">
-                <div class="field"><label for="studio-port">本机 Studio 端口</label><input id="studio-port" inputmode="numeric" value="8080"></div>
-              </div>
-              <div class="actions"><button type="button" data-action="pair-studio">关联本机 Studio</button><button type="button" data-action="refresh-studio">检查关联状态</button><button type="button" data-action="forget-studio">撤销/忘记关联</button></div>
-              <div class="actions"><button type="button" data-action="send-studio" disabled>发送到已关联 Studio</button><button type="button" data-action="download-last-export" disabled>重新下载最近归档</button></div>
-              <details>
-                <summary>兼容旧版 Toolkit：一次性接收码</summary>
-                <p class="message">请先完成导出，再到 Studio 生成 15 分钟有效的一次性接收码。</p>
-                <div class="field"><label for="studio-pairing-code">一次性接收码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
-                <div class="actions"><button type="button" data-action="send-studio-legacy" disabled>使用接收码发送</button></div>
-              </details>
-            </div>
-          </section>
-          <section data-panel="import" hidden>
-            <h3>导入关注</h3>
-            <div class="field"><label for="archive-files">选择旧版 JSON 或 v2 ZIP</label><input id="archive-files" type="file" multiple accept=".json,.zip,.treehole.zip,application/json,application/zip"></div>
-            <div class="actions"><button type="button" data-action="preview-import">解析并预检</button><button class="primary" type="button" data-action="execute-import" disabled>确认导入</button></div>
-            <div class="preview" data-import-preview hidden></div>
-          </section>
-          <div class="status-card" aria-busy="false">
-            <div class="status-line"><strong data-state>空闲</strong><span data-count>0 / 0</span></div>
+          <div class="status-card warning" data-task-card aria-busy="false" hidden>
+            <div class="status-line"><strong data-state>准备任务</strong><span data-count></span></div>
             <progress value="0" max="1" aria-label="任务进度"></progress>
-            <div class="actions"><button type="button" data-action="pause" disabled>暂停</button><button type="button" data-action="resume" disabled>继续</button><button class="danger" type="button" data-action="cancel" disabled>取消</button><button type="button" data-action="retry" disabled>仅重试失败项</button></div>
             <p class="message" role="status" aria-live="polite"></p>
+            <div class="actions" data-task-actions>
+              <button type="button" data-action="pause" hidden>暂停</button>
+              <button type="button" data-action="resume" hidden>继续上次任务</button>
+              <button class="danger" type="button" data-action="cancel" hidden>取消任务</button>
+              <button type="button" data-action="retry" hidden>重试未完成项</button>
+            </div>
           </div>
+          <section id="panel-export" role="tabpanel" aria-labelledby="tab-export" data-panel="export">
+            <p class="intro">无需安装其他应用。备份只读取树洞数据，不会修改关注、帖子或评论；文件会保存到浏览器下载位置。</p>
+            <h3>备份哪些内容</h3>
+            <div class="grid">
+              <div class="field full"><label for="scope">备份范围</label><select id="scope"><option value="all">全部关注</option><option value="group">某个收藏分组</option><option value="pids">指定帖子 PID</option><option value="date">按帖子发布日期</option></select></div>
+              <div class="field conditional" data-for-scope="group" hidden><label for="bookmark">收藏分组</label><select id="bookmark"><option value="">正在加载分组…</option></select></div>
+              <div class="field full conditional" data-for-scope="pids" hidden><label for="export-pids">帖子 PID</label><textarea id="export-pids" placeholder="例如：123456 234567"></textarea><p class="hint">可用空格、逗号或换行分隔。</p></div>
+              <div class="field conditional" data-for-scope="date" hidden><label for="start-date">最早发布日期（可不填）</label><input id="start-date" type="date"></div>
+              <div class="field conditional" data-for-scope="date" hidden><label for="end-date">最晚发布日期（可不填）</label><input id="end-date" type="date"></div>
+            </div>
+            <p class="summary-line" data-export-summary>全部关注 · 包含评论 · 附带阅读版</p>
+            <details class="disclosure" data-export-options>
+              <summary>更多备份选项</summary>
+              <div class="disclosure-body">
+                <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>附带可直接阅读的文本</label></div>
+                <div class="field"><label for="reference-mode">补全一层引用内容</label><select id="reference-mode"><option value="none">不补全引用</option><option value="body">补全正文中的引用</option><option value="all">补全正文和评论中的引用</option></select></div>
+                <p class="hint">补全引用可能加入所选范围之外的帖子，并增加请求数量。</p>
+              </div>
+            </details>
+            <input id="delivery-download" type="checkbox" checked hidden aria-hidden="true">
+            <div class="actions primary-actions"><button class="primary" type="button" data-action="export">生成并下载备份</button></div>
+            <p class="hint">每次都会生成一份新的完整快照；生成后仍可重新下载。</p>
+
+            <div class="result-card" data-recent-export hidden>
+              <h3>最近备份</h3>
+              <p class="message" data-recent-export-summary>备份已经生成并保存到本机。</p>
+              <p class="filename" data-recent-export-filename></p>
+              <div class="actions">
+                <button class="primary" type="button" data-action="download-last-export">重新下载</button>
+                <button type="button" data-action="repeat-export">按相同设置再次备份</button>
+                <button type="button" data-action="send-studio" hidden>发送到 Studio</button>
+              </div>
+            </div>
+
+            <details class="disclosure studio-section" data-studio-section>
+              <summary><span class="studio-summary"><span>可选：连接 PkuHoleStudio</span><span class="badge" data-studio-badge>未关联</span></span></summary>
+              <div class="disclosure-body">
+                <p class="hint">Toolkit 可独立完成备份和迁移。只有想把备份直接发送到本机 Studio 时才需要关联。</p>
+                <p class="message" data-studio-connection>尚未关联 PkuHoleStudio。</p>
+                <p class="message" data-studio-message role="status" aria-live="polite"></p>
+                <div class="studio-options" data-studio-options hidden><label><input id="delivery-studio" type="checkbox">备份完成后同时发送到 Studio</label></div>
+                <div class="actions"><button type="button" data-action="pair-studio">连接 PkuHoleStudio</button><button type="button" data-action="refresh-studio" hidden>检查连接</button><button class="quiet" type="button" data-action="forget-studio" hidden>忘记关联</button></div>
+                <details class="nested">
+                  <summary>连接设置</summary>
+                  <div class="field"><label for="studio-port">本机 Studio 端口</label><input id="studio-port" inputmode="numeric" value="8080"></div>
+                </details>
+                <details class="nested">
+                  <summary>兼容旧版：使用一次性接收码</summary>
+                  <p class="hint">请先完成备份，再到 Studio 生成 15 分钟有效的一次性接收码。</p>
+                  <div class="field"><label for="studio-pairing-code">一次性接收码</label><input id="studio-pairing-code" inputmode="text" autocomplete="off" placeholder="8080:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"></div>
+                  <div class="actions"><button type="button" data-action="send-studio-legacy" disabled>使用接收码发送最近备份</button></div>
+                </details>
+              </div>
+              </details>
+          </section>
+          <section id="panel-import" role="tabpanel" aria-labelledby="tab-import" data-panel="import" hidden>
+            <p class="intro">迁移只会向当前登录账号新增尚未关注的帖子；不会取消已有关注，也不会发布备份中的正文或评论。</p>
+            <p class="step-label">第 1 步 · 选择备份</p>
+            <div class="field"><label for="archive-files">Toolkit 备份文件</label><input id="archive-files" type="file" multiple accept=".json,.zip,.treehole.zip,application/json,application/zip"><p class="hint">支持 .treehole.zip、普通 ZIP 和旧版 JSON；多个文件会自动合并去重。</p></div>
+            <p class="step-label">第 2 步 · 检查内容</p>
+            <div class="actions primary-actions"><button class="primary" type="button" data-action="preview-import">检查备份</button></div>
+            <p class="hint">检查只会读取当前关注列表，不会修改账号。</p>
+            <div class="preview" data-import-preview hidden>
+              <h3>检查结果</h3>
+              <div class="metrics">
+                <div class="metric"><strong data-preview-new>0</strong><span>将新增</span></div>
+                <div class="metric"><strong data-preview-followed>0</strong><span>已关注并跳过</span></div>
+                <div class="metric"><strong data-preview-referenced>0</strong><span>仅作引用，不迁移</span></div>
+                <div class="metric"><strong data-preview-invalid>0</strong><span>存在问题</span></div>
+              </div>
+              <p class="message" data-import-decision></p>
+              <details class="nested"><summary>查看技术详情</summary><p class="message" data-import-details></p></details>
+              <p class="step-label">第 3 步 · 确认写入</p>
+              <div class="actions primary-actions"><button class="primary" type="button" data-action="execute-import" disabled>等待检查结果</button></div>
+            </div>
+          </section>
         </main>
       </div>
     </div>`;
@@ -304,9 +435,12 @@ export function mountToolkit({
   let lastExportOptions = null;
   let importPreview = null;
   let lastArchive = null;
+  let lastArchiveManifest = null;
   let studioBridgeState = null;
   let pairingWatch = null;
   let isRunning = false;
+  let isStudioBusy = false;
+  let taskState = 'idle';
   let bookmarksLoaded = false;
   let loadedAccountFingerprint = null;
   const mountedAt = Date.now();
@@ -323,7 +457,7 @@ export function mountToolkit({
     entry = documentObject.createElement('button');
     entry.id = ENTRY_ID;
     entry.type = 'button';
-    entry.textContent = '归档/迁移';
+    entry.textContent = '树洞备份';
     entry.style.minWidth = '78px';
     entry.style.marginInline = '4px';
   }
@@ -338,7 +472,7 @@ export function mountToolkit({
   const $ = (selector) => shadow.querySelector(selector);
   const overlay = $('.overlay');
   const statusLabel = $('[data-state]');
-  const statusCard = statusLabel.closest('.status-card');
+  const statusCard = $('[data-task-card]');
   const countLabel = $('[data-count]');
   const progress = $('progress');
   const message = statusCard.querySelector('.message');
@@ -348,15 +482,21 @@ export function mountToolkit({
   const retryButton = $('[data-action="retry"]');
   const importExecuteButton = $('[data-action="execute-import"]');
   const studioConnectionMessage = $('[data-studio-connection]');
+  const studioMessage = $('[data-studio-message]');
+  const studioSection = $('[data-studio-section]');
+  const studioBadge = $('[data-studio-badge]');
+  const studioOptions = $('[data-studio-options]');
   const studioPairButton = $('[data-action="pair-studio"]');
   const studioRefreshButton = $('[data-action="refresh-studio"]');
   const studioForgetButton = $('[data-action="forget-studio"]');
   const studioSendButton = $('[data-action="send-studio"]');
   const studioLegacySendButton = $('[data-action="send-studio-legacy"]');
   const lastExportDownloadButton = $('[data-action="download-last-export"]');
+  const repeatExportButton = $('[data-action="repeat-export"]');
+  const recentExport = $('[data-recent-export]');
   const deliveryDownload = $('#delivery-download');
   const deliveryStudio = $('#delivery-studio');
-  deliveryDownload.checked = savedDestinations.download;
+  deliveryDownload.checked = true;
   deliveryStudio.checked = savedDestinations.studio;
 
   function placeEntry() {
@@ -380,28 +520,136 @@ export function mountToolkit({
     message.classList.toggle('error', isError);
   }
 
-  function setRunning(running) {
-    isRunning = running;
-    statusCard.setAttribute('aria-busy', String(running));
-    pauseButton.disabled = !running;
-    cancelButton.disabled = !running;
-    resumeButton.disabled = running || !activeJobId;
-    retryButton.disabled = running || !activeJobId;
-    $('[data-action="export"]').disabled = running;
-    studioSendButton.disabled = running || !lastArchive || studioBridgeState?.status !== 'paired';
-    studioLegacySendButton.disabled = running || !lastArchive;
-    lastExportDownloadButton.disabled = running || !lastArchive;
-    studioPairButton.disabled = running || studioBridgeState?.status === 'paired' || studioBridgeState?.status === 'pending';
-    studioRefreshButton.disabled = running || !studioBridgeState;
-    studioForgetButton.disabled = running || !studioBridgeState;
-    deliveryDownload.disabled = running;
-    deliveryStudio.disabled = running;
-    $('[data-action="preview-import"]').disabled = running;
+  function setStudioMessage(text, isError = false) {
+    studioMessage.textContent = text || '';
+    studioMessage.classList.toggle('error', isError);
+  }
+
+  function renderControls() {
+    const busy = isRunning || isStudioBusy;
+    const resumable = !busy && Boolean(activeJobId) && taskState === 'paused';
+    const retryable = !busy && Boolean(activeJobId) && ['partial', 'failed'].includes(taskState);
+    const controllable = isRunning && Boolean(activeJob) && ['planning', 'running'].includes(taskState);
+    const discardable = !busy && Boolean(activeJobId) && taskState === 'paused';
+    const showTask =
+      isRunning ||
+      ['paused', 'partial', 'failed', 'cancelled'].includes(taskState) ||
+      (activeKind === 'import' && taskState === 'completed');
+
+    statusCard.hidden = !showTask;
+    statusCard.setAttribute('aria-busy', String(isRunning));
+    pauseButton.hidden = !controllable;
+    pauseButton.disabled = !controllable;
+    cancelButton.hidden = !(controllable || discardable);
+    cancelButton.disabled = !(controllable || discardable);
+    cancelButton.textContent = discardable ? '放弃断点' : '取消任务';
+    resumeButton.hidden = !resumable;
+    resumeButton.disabled = !resumable;
+    retryButton.hidden = !retryable;
+    retryButton.disabled = !retryable;
+    $('[data-action="export"]').disabled = busy;
+    $('[data-action="preview-import"]').disabled = busy;
+    studioSendButton.disabled = busy || !lastArchive || studioBridgeState?.status !== 'paired';
+    studioLegacySendButton.disabled = busy || !lastArchive;
+    lastExportDownloadButton.disabled = busy || !lastArchive;
+    repeatExportButton.disabled = busy || !lastExportOptions;
+    studioPairButton.disabled = busy || studioBridgeState?.status === 'paired' || studioBridgeState?.status === 'pending';
+    studioRefreshButton.disabled = busy || !studioBridgeState;
+    studioForgetButton.disabled = busy || !studioBridgeState;
+    deliveryDownload.disabled = busy;
+    deliveryStudio.disabled = busy || studioBridgeState?.status !== 'paired';
     importExecuteButton.disabled =
-      running ||
+      busy ||
       !importPreview ||
       importPreview.remoteComplete !== true ||
       importPreview.newPids?.length === 0;
+  }
+
+  function setTaskStatus(state) {
+    taskState = state || 'idle';
+    statusLabel.dataset.taskState = taskState;
+    statusLabel.textContent = taskStatusText(taskState, activeKind || 'export');
+    statusCard.classList.toggle('warning', ['paused', 'partial'].includes(taskState));
+    renderControls();
+  }
+
+  function setRunning(running) {
+    isRunning = running;
+    renderControls();
+  }
+
+  function setStudioBusy(busy) {
+    isStudioBusy = busy;
+    renderControls();
+  }
+
+  function renderRecentExport(manifest = lastArchiveManifest, note = '') {
+    recentExport.hidden = !lastArchive;
+    if (!lastArchive) {
+      $('[data-recent-export-filename]').textContent = '';
+      renderControls();
+      return;
+    }
+    const counts = manifest?.counts;
+    $('[data-recent-export-summary]').textContent = note || (counts
+      ? `${manifest.complete ? '备份完成' : '部分备份'}：${counts.exportedHoles} 个帖子、${counts.comments} 条评论。`
+      : '最近生成的备份可以直接重新下载，不需要再次抓取。');
+    $('[data-recent-export-filename]').textContent = lastArchive.filename || '';
+    studioSendButton.hidden = studioBridgeState?.status !== 'paired';
+    renderControls();
+  }
+
+  function renderImportPreview(preview) {
+    const previewElement = $('[data-import-preview]');
+    previewElement.hidden = !preview;
+    if (!preview) {
+      importExecuteButton.textContent = '等待检查结果';
+      renderControls();
+      return;
+    }
+    $('[data-preview-new]').textContent = String(preview.newPids.length);
+    $('[data-preview-followed]').textContent = String(preview.alreadyFollowed.length);
+    $('[data-preview-referenced]').textContent = String(preview.excludedReferenced);
+    $('[data-preview-invalid]').textContent = String(preview.invalidFiles.length);
+    $('[data-import-details]').textContent = [
+      `读取文件：${preview.archives.length}`,
+      `有效 PID：${preview.allPids.length}`,
+      `重复记录：${preview.duplicateCount}`,
+    ].join(' · ');
+    const decision = $('[data-import-decision]');
+    if (preview.invalidFiles.length > 0 && preview.allPids.length === 0) {
+      decision.textContent = '没有从所选文件中读取到有效帖子，请展开技术详情检查文件。';
+      decision.classList.add('error');
+      importExecuteButton.textContent = '没有可迁移的关注';
+    } else if (preview.remoteComplete !== true) {
+      decision.textContent = '当前关注列表没有读取完整。为避免误判，本次禁止继续，请稍后重新检查。';
+      decision.classList.add('error');
+      importExecuteButton.textContent = '当前无法迁移';
+    } else if (preview.newPids.length === 0) {
+      decision.textContent = '当前账号已经关注备份中的全部帖子，无需执行迁移。';
+      decision.classList.remove('error');
+      importExecuteButton.textContent = '无需新增关注';
+    } else {
+      decision.textContent = `确认后只会向当前账号新增 ${preview.newPids.length} 个关注。`;
+      decision.classList.remove('error');
+      importExecuteButton.textContent = `向当前账号新增 ${preview.newPids.length} 个关注`;
+    }
+    renderControls();
+  }
+
+  function updateExportSummary() {
+    const options = exportOptions();
+    const summary = exportSummaryText(options);
+    let scopeDetail = '';
+    if (options.scope.type === 'group') {
+      const selected = $('#bookmark').selectedOptions?.[0]?.textContent;
+      if (selected && options.scope.bookmarkId) scopeDetail = `“${selected}”`;
+    } else if (options.scope.type === 'pids') {
+      scopeDetail = options.scope.pids.length ? `${options.scope.pids.length} 个 PID` : '尚未填写 PID';
+    } else if (options.scope.type === 'date') {
+      scopeDetail = [options.scope.startDate || '不限起始', options.scope.endDate || '不限结束'].join(' 至 ');
+    }
+    $('[data-export-summary]').textContent = scopeDetail ? `${summary} · ${scopeDetail}` : summary;
   }
 
   function useAccountFingerprint(accountFingerprint) {
@@ -419,16 +667,19 @@ export function mountToolkit({
     loadedAccountFingerprint = next.accountFingerprint;
     if (!next.accountChanged) return false;
     lastArchive = next.lastArchive;
+    lastArchiveManifest = null;
     lastExportOptions = next.lastExportOptions;
     activeJobId = next.activeJobId;
     activeKind = next.activeKind;
     importPreview = next.importPreview;
     bookmarksLoaded = false;
     $('#bookmark').replaceChildren();
-    const previewElement = $('[data-import-preview]');
-    previewElement.hidden = true;
-    previewElement.textContent = '';
-    setRunning(isRunning);
+    renderImportPreview(null);
+    renderRecentExport();
+    if (!isRunning) {
+      setMessage('登录账号已经变化，请在当前账号重新选择备份范围或重新检查迁移文件。');
+      setTaskStatus('idle');
+    } else renderControls();
     return true;
   }
 
@@ -443,18 +694,38 @@ export function mountToolkit({
   function renderStudioBridgeState() {
     const state = studioBridgeState;
     if (state?.status === 'paired') {
-      studioConnectionMessage.textContent = `已关联 ${state.name || 'Toolkit 设备'}，发送时会自动申请仅对当前归档有效的一次性票据。`;
+      studioConnectionMessage.textContent = `已连接 ${state.name || '本机 Studio'}。可以发送最近备份，或在备份完成后自动发送。`;
       $('#studio-port').value = String(state.port || 8080);
-      studioPairButton.textContent = 'Studio 已关联';
+      studioBadge.textContent = '已连接';
+      studioBadge.classList.add('connected');
+      studioOptions.hidden = false;
+      studioPairButton.hidden = true;
+      studioRefreshButton.hidden = false;
+      studioForgetButton.hidden = false;
     } else if (state?.status === 'pending') {
       studioConnectionMessage.textContent = `等待 Studio 确认。请在 Studio“Toolkit 传输”页核对：${state.verificationCode || '------'}`;
       $('#studio-port').value = String(state.port || 8080);
-      studioPairButton.textContent = '等待 Studio 确认';
+      studioBadge.textContent = '等待确认';
+      studioBadge.classList.remove('connected');
+      studioOptions.hidden = true;
+      studioPairButton.hidden = true;
+      studioRefreshButton.hidden = false;
+      studioForgetButton.hidden = false;
+      studioSection.open = true;
     } else {
-      studioConnectionMessage.textContent = '尚未关联 Studio。首次关联需要在 Studio 核对一次，之后发送不再复制接收码。';
-      studioPairButton.textContent = '关联本机 Studio';
+      studioConnectionMessage.textContent = '尚未连接。只有需要把备份直接发送到本机 Studio 时才需要设置。';
+      studioBadge.textContent = '未连接';
+      studioBadge.classList.remove('connected');
+      studioOptions.hidden = true;
+      deliveryStudio.checked = false;
+      writeArchiveDestinations(preferenceStorage, { download: true, studio: false });
+      studioPairButton.hidden = false;
+      studioPairButton.textContent = '连接 PkuHoleStudio';
+      studioRefreshButton.hidden = true;
+      studioForgetButton.hidden = true;
     }
-    setRunning(isRunning);
+    renderRecentExport();
+    renderControls();
   }
 
   function handleProgress(event) {
@@ -463,12 +734,13 @@ export function mountToolkit({
     progress.max = Math.max(1, total);
     progress.value = Math.min(completed, progress.max);
     countLabel.textContent = `${completed} / ${total || '?'}`;
-    if (event.state) statusLabel.textContent = event.state;
-    if (event.pid) setMessage(`正在处理 #${event.pid}（${event.phase || ''}）`);
+    if (event.state) setTaskStatus(event.state);
+    else if (!['planning', 'previewing'].includes(taskState)) setTaskStatus('running');
+    if (event.pid) setMessage(`正在处理帖子 #${event.pid}`);
     else if (event.phase === 'archive_files') {
-      setMessage(`正在解析归档文件：${completed} / ${total || '?'}…`);
+      setMessage(`正在读取备份文件：${completed} / ${total || '?'}…`);
     } else if (event.phase === 'remote_followed') {
-      setMessage(`正在读取当前关注：${completed} / ${total || '?'}…`);
+      setMessage(`正在读取当前关注列表：${completed} / ${total || '?'}…`);
     }
   }
 
@@ -493,6 +765,7 @@ export function mountToolkit({
         select.append(option);
       }
       bookmarksLoaded = true;
+      updateExportSummary();
     } catch (error) {
       select.replaceChildren();
       const option = documentObject.createElement('option');
@@ -500,6 +773,7 @@ export function mountToolkit({
       option.textContent = '分组加载失败';
       select.append(option);
       setMessage(error.message, true);
+      if (!isRunning) setTaskStatus('failed');
     }
   }
 
@@ -516,12 +790,14 @@ export function mountToolkit({
         if (activeJob || isRunning) return null;
         if (restored) {
           lastArchive = restored.archive;
+          lastArchiveManifest = restored.job.manifest || null;
           lastExportOptions = restored.job.options;
+          renderRecentExport(lastArchiveManifest, '已恢复最近完成的备份，可以直接重新下载。');
         }
         let job = selectLatestResumableJob(jobs, credentials.accountFingerprint);
         if (!job) {
+          setTaskStatus('idle');
           setRunning(false);
-          if (restored) setMessage('已恢复最近完成的归档，可重新下载或发送到 Studio。');
           return null;
         }
         if (['planning', 'running'].includes(job.state)) {
@@ -532,10 +808,13 @@ export function mountToolkit({
         activeJobId = job.id;
         activeKind = job.type;
         if (job.type === 'export') lastExportOptions = job.options;
-        if (job.type === 'import') importPreview = job.preview;
-        statusLabel.textContent = 'paused';
+        if (job.type === 'import') {
+          importPreview = job.preview;
+          renderImportPreview(importPreview);
+        }
         countLabel.textContent = `${job.completed || 0} / ${job.total || '?'}`;
-        setMessage(`发现可恢复的${job.type === 'export' ? '导出' : '导入'}任务。`);
+        setMessage(`发现未完成的${job.type === 'export' ? '备份' : '关注迁移'}，断点仍然保留。`);
+        setTaskStatus(job.state);
         setRunning(false);
         return job;
       } catch (error) {
@@ -564,8 +843,8 @@ export function mountToolkit({
 
   function archiveDestinations() {
     return writeArchiveDestinations(preferenceStorage, {
-      download: deliveryDownload.checked,
-      studio: deliveryStudio.checked,
+      download: true,
+      studio: deliveryStudio.checked && studioBridgeState?.status === 'paired',
     });
   }
 
@@ -593,41 +872,16 @@ export function mountToolkit({
     return delivery;
   }
 
-  function deliveryMessage(delivery) {
-    const messages = [];
-    if (delivery.download === 'started') messages.push('已开始下载本地归档');
-    else if (delivery.download === 'failed') {
-      messages.push(`启动本地下载失败：${delivery.downloadError?.message || '未知错误'}`);
-    }
-    if (delivery.studio === 'awaiting_confirmation') {
-      messages.push(
-        `已发送到 Studio 并通过预检（${delivery.studioResult?.preflight?.counts?.valid_items ?? '?'} 个有效帖子），请在 Studio 确认导入`,
-      );
-    } else if (delivery.studio === 'not_connected') {
-      messages.push('尚未发送到 Studio：请先完成关联');
-    } else if (delivery.studio === 'failed') {
-      messages.push(`发送 Studio 失败：${delivery.studioError?.message || '未知错误'}`);
-    }
-    return messages.join('；');
-  }
-
   async function runExport(options, jobId = null) {
     const destinations = archiveDestinations();
-    if (!destinations.download && !destinations.studio) {
-      setMessage('请至少选择“下载归档到本机”或“发送到已关联 Studio”之一', true);
-      return;
-    }
-    if (destinations.studio && !destinations.download && studioBridgeState?.status !== 'paired') {
-      setMessage('当前只选择了发送 Studio，请先关联本机 Studio；也可以同时选择下载到本机', true);
-      return;
-    }
     if (!jobId) {
       activeJobId = null;
       activeKind = null;
     }
+    activeKind = 'export';
+    setTaskStatus('planning');
     setRunning(true);
-    setMessage('正在规划导出范围…');
-    statusLabel.textContent = 'planning';
+    setMessage('正在读取所选范围，随后会逐个保存帖子和评论…');
     try {
       const { credentials, accountChanged } = await credentialsForCurrentAccount();
       if (accountChanged && jobId) {
@@ -638,6 +892,7 @@ export function mountToolkit({
         throw new AppError(ERROR_CODES.INVALID_INPUT, '账号已切换，请重新选择收藏分组');
       }
       activeKind = 'export';
+      lastExportOptions = options;
       activeJob = new ExportJob({
         api: apiForAccount(api, credentials.accountFingerprint),
         store,
@@ -649,26 +904,37 @@ export function mountToolkit({
       const result = await activeJob.run(options, { jobId });
       activeJobId = result.job.id;
       if (result.paused) {
-        statusLabel.textContent = 'paused';
-        setMessage('任务已暂停，可稍后继续。');
+        setTaskStatus('paused');
+        setMessage('任务已经安全暂停，断点会保留 7 天。');
         return;
       }
       lastArchive = result.archive;
+      lastArchiveManifest = result.manifest;
       const delivery = await deliverExportArchive(result.archive, destinations);
-      statusLabel.textContent = result.job.state;
+      setTaskStatus(result.job.state);
       countLabel.textContent = `${result.manifest.counts.exportedHoles} / ${result.manifest.counts.expectedHoles ?? '?'}`;
       const archiveMessage = result.manifest.complete
-          ? '导出完成。断点保留 7 天，可重新下载。'
-          : `部分导出：${result.manifest.errors.length} 项失败，请查看 manifest 或重试。`;
-      const sentMessage = deliveryMessage(delivery);
-      setMessage(
-        sentMessage ? `${archiveMessage}\n${sentMessage}。` : archiveMessage,
-        !result.manifest.complete || Boolean(delivery.downloadError || delivery.studioError),
-      );
+        ? delivery.download === 'started'
+          ? '备份完成，浏览器下载已经开始。'
+          : '备份已经生成，但浏览器没有启动下载；可以点击“重新下载”。'
+        : `已生成部分备份，${result.manifest.errors.length} 项未完成；可以先下载，也可以重试。`;
+      renderRecentExport(result.manifest, archiveMessage);
+      setMessage(archiveMessage, !result.manifest.complete || delivery.download === 'failed');
+      if (delivery.studio === 'awaiting_confirmation') {
+        setStudioMessage(
+          `已发送并通过预检（${delivery.studioResult?.preflight?.counts?.valid_items ?? '?'} 个有效帖子），请回到 Studio 确认导入。`,
+        );
+      } else if (delivery.studio === 'failed') {
+        setStudioMessage(`本地备份不受影响；发送失败：${delivery.studioError?.message || '未知错误'}`, true);
+        studioSection.open = true;
+      }
     } catch (error) {
       activeJobId = activeJobId || activeJob?.jobId || null;
-      setMessage(error.message || '导出失败', true);
-      statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
+      const cancelled = error.code === ERROR_CODES.CANCELLED;
+      setMessage(cancelled ? '备份已取消。' : error.message || '备份失败', !cancelled);
+      setTaskStatus(
+        cancelled ? 'cancelled' : error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed',
+      );
     } finally {
       activeJob = null;
       setRunning(false);
@@ -677,17 +943,18 @@ export function mountToolkit({
 
   async function previewImport() {
     const files = [...$('#archive-files').files];
-    if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择归档文件');
+    if (!files.length) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先选择 Toolkit 备份文件');
     activeJobId = null;
-    activeKind = null;
+    activeKind = 'import';
+    importPreview = null;
+    renderImportPreview(null);
+    setTaskStatus('previewing');
     setRunning(true);
-    statusLabel.textContent = 'previewing';
     countLabel.textContent = '0 / ?';
     progress.removeAttribute('value');
-    setMessage('正在解析归档并读取当前关注列表；关注较多时可能需要几十秒…');
+    setMessage('正在读取备份并检查当前关注列表；此步骤不会修改账号。');
     try {
       const { credentials } = await credentialsForCurrentAccount();
-      activeKind = 'import';
       activeJob = new ImportJob({
         api: apiForAccount(api, credentials.accountFingerprint),
         store,
@@ -695,29 +962,22 @@ export function mountToolkit({
         onProgress: handleProgress,
       });
       importPreview = await activeJob.preview(files);
-      const previewElement = $('[data-import-preview]');
-      previewElement.hidden = false;
-      previewElement.textContent = [
-        `文件：${importPreview.archives.length}`,
-        `唯一 PID：${importPreview.allPids.length}`,
-        `将新增：${importPreview.newPids.length}`,
-        `已关注：${importPreview.alreadyFollowed.length}`,
-        `仅归档引用（不导入）：${importPreview.excludedReferenced}`,
-        `重复：${importPreview.duplicateCount}`,
-        `无效文件/记录：${importPreview.invalidFiles.length}`,
-      ].join('\n');
-      statusLabel.textContent = 'previewed';
+      renderImportPreview(importPreview);
+      setTaskStatus('previewed');
       progress.max = 1;
       progress.value = 1;
       countLabel.textContent = `${importPreview.allPids.length} PID`;
       setMessage(
         importPreview.remoteComplete !== true
-          ? '预检未完成：当前关注列表读取不完整，已禁止导入，请稍后重试。'
+          ? '检查未完成：当前关注列表读取不完整，已禁止迁移，请稍后重试。'
           : importPreview.newPids.length
-          ? '预检完成。请核对数量后确认导入。'
-          : '预检完成：所有 PID 均已关注，无需执行导入。',
+          ? '检查完成，请核对数量后确认新增关注。'
+          : '检查完成：所有帖子均已关注，无需迁移。',
         importPreview.remoteComplete !== true,
       );
+    } catch (error) {
+      setTaskStatus(error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed');
+      throw error;
     } finally {
       activeJob = null;
       setRunning(false);
@@ -725,7 +985,10 @@ export function mountToolkit({
   }
 
   async function executeImport(jobId = null) {
+    activeKind = 'import';
+    setTaskStatus('running');
     setRunning(true);
+    setMessage('正在准备向当前账号新增关注…');
     try {
       const { credentials, accountChanged } = await credentialsForCurrentAccount();
       if (accountChanged) {
@@ -734,9 +997,10 @@ export function mountToolkit({
       if (!importPreview) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先执行预检');
       if (
         !windowObject.confirm(
-          `将对当前账号新增关注 ${importPreview.newPids.length} 个洞。确认继续？`,
+          `即将向当前账号新增 ${importPreview.newPids.length} 个关注，不会取消或修改已有关注。是否继续？`,
         )
       ) {
+        setTaskStatus('previewed');
         return;
       }
       if (!jobId) activeJobId = null;
@@ -749,7 +1013,7 @@ export function mountToolkit({
       });
       const result = await activeJob.execute(importPreview, { jobId });
       activeJobId = result.job.id;
-      statusLabel.textContent = result.job.state;
+      setTaskStatus(result.job.state);
       if (!result.paused) {
         const text = buildImportAuditText(result.audit);
         downloadBlob(
@@ -760,14 +1024,17 @@ export function mountToolkit({
       }
       setMessage(
         result.paused
-          ? '导入已暂停。'
-          : `导入结束：成功 ${result.audit.followed}，失败 ${result.audit.failed}，未知 ${result.audit.unknown}。`,
+          ? '关注迁移已暂停，稍后可以继续。'
+          : `迁移完成：新增 ${result.audit.followed}，失败 ${result.audit.failed}，结果未知 ${result.audit.unknown}。审计报告已下载。`,
         !result.paused && (result.audit.failed > 0 || result.audit.unknown > 0),
       );
     } catch (error) {
       activeJobId = activeJobId || activeJob?.jobId || null;
-      setMessage(error.message || '导入失败', true);
-      statusLabel.textContent = error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed';
+      const cancelled = error.code === ERROR_CODES.CANCELLED;
+      setMessage(cancelled ? '关注迁移已取消。' : error.message || '关注迁移失败', !cancelled);
+      setTaskStatus(
+        cancelled ? 'cancelled' : error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed',
+      );
     } finally {
       activeJob = null;
       setRunning(false);
@@ -826,8 +1093,7 @@ export function mountToolkit({
         if (pairingWatch !== watch || watch.controller.signal.aborted) return;
         studioBridgeState = paired;
         renderStudioBridgeState();
-        statusLabel.textContent = 'studio_paired';
-        setMessage('Studio 关联成功。今后可直接发送，不再复制接收码。');
+        setStudioMessage('连接成功。今后可以直接发送备份，不需要重复输入接收码。');
       })
       .catch((error) => {
         if (
@@ -839,8 +1105,7 @@ export function mountToolkit({
         }
         studioBridgeState = null;
         renderStudioBridgeState();
-        statusLabel.textContent = 'failed';
-        setMessage(error.message || 'Studio 关联失败', true);
+        setStudioMessage(error.message || 'PkuHoleStudio 连接失败', true);
       })
       .finally(() => {
         if (pairingWatch === watch) pairingWatch = null;
@@ -849,16 +1114,16 @@ export function mountToolkit({
 
   async function pairStudio() {
     const port = $('#studio-port').value.trim();
-    setRunning(true);
-    statusLabel.textContent = 'pairing_studio';
-    setMessage('正在向本机 Studio 发起关联请求…');
+    setStudioBusy(true);
+    studioSection.open = true;
+    setStudioMessage('正在向本机 PkuHoleStudio 发起连接请求…');
     try {
       await cancelStudioPairingWatch();
       const previous = await studioBridgeStorage.get();
       if (previous?.status === 'paired') {
         studioBridgeState = previous;
         renderStudioBridgeState();
-        setMessage('Studio 已完成关联，无需重新发起。');
+        setStudioMessage('PkuHoleStudio 已经连接，无需重新发起。');
         return;
       }
       if (previous?.status === 'pending') await studioBridgeStorage.delete();
@@ -868,27 +1133,25 @@ export function mountToolkit({
       renderStudioBridgeState();
       const studioURL = `http://127.0.0.1:${studioBridgeState.port}/imports?view=bridge`;
       windowObject.open?.(studioURL, '_blank', 'noopener');
-      setMessage(`关联请求已发出，请在 Studio 核对 ${studioBridgeState.verificationCode} 并确认。`);
+      setStudioMessage(`请求已发出，请在 Studio 核对验证码 ${studioBridgeState.verificationCode} 并确认。`);
       watchStudioPairing(studioBridgeState);
     } catch (error) {
-      statusLabel.textContent = 'failed';
-      setMessage(error.message || '无法发起 Studio 关联', true);
+      setStudioMessage(error.message || '无法连接 PkuHoleStudio', true);
     } finally {
-      setRunning(false);
+      setStudioBusy(false);
     }
   }
 
   async function sendToTrustedStudio() {
-    setRunning(true);
-    statusLabel.textContent = 'sending';
-    setMessage('正在签名并把归档发送到已关联 Studio…');
+    setStudioBusy(true);
+    studioSection.open = true;
+    setStudioMessage('正在签名并发送最近备份…');
     try {
       await credentialsForCurrentAccount();
       if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
       if (studioBridgeState?.status !== 'paired') throw new AppError(ERROR_CODES.UNAUTHORIZED, '请先关联本机 Studio');
       const result = await sendArchiveToTrustedStudio(lastArchive, { state: studioBridgeState, storage: studioBridgeStorage });
-      statusLabel.textContent = 'awaiting_confirmation';
-      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+      setStudioMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子，请回到 Studio 确认导入。`);
     } catch (error) {
       if (
         error.status === 404 ||
@@ -898,49 +1161,46 @@ export function mountToolkit({
         studioBridgeState = null;
         renderStudioBridgeState();
       }
-      statusLabel.textContent = 'failed';
-      setMessage(error.message || '发送到 Studio 失败', true);
+      setStudioMessage(`本地备份不受影响；发送失败：${error.message || '未知错误'}`, true);
     } finally {
-      setRunning(false);
+      setStudioBusy(false);
     }
   }
 
   async function forgetStudioConnection() {
-    setRunning(true);
+    setStudioBusy(true);
     try {
       await cancelStudioPairingWatch();
       const previous = (await studioBridgeStorage.get()) || studioBridgeState;
       studioBridgeState = null;
       renderStudioBridgeState();
       const result = await forgetStudioDevice({ state: previous, storage: studioBridgeStorage });
-      setMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地关联请求。');
+      setStudioMessage(result.revoked ? '已从 Toolkit 和 Studio 撤销设备关联。' : '已删除本地连接请求。');
     } catch (error) {
       studioBridgeState = null;
       renderStudioBridgeState();
-      setMessage(`本地关联已删除；Studio 当前不可达，稍后可在 Studio 设备列表清理。${error.message ? `（${error.message}）` : ''}`);
+      setStudioMessage(`本地关联已删除；Studio 当前不可达，稍后可在 Studio 设备列表清理。${error.message ? `（${error.message}）` : ''}`);
     } finally {
-      setRunning(false);
+      setStudioBusy(false);
     }
   }
 
   async function sendToStudioWithCode() {
-    setRunning(true);
-    statusLabel.textContent = 'sending';
-    setMessage('正在把归档发送到本机 Studio…');
+    setStudioBusy(true);
+    studioSection.open = true;
+    setStudioMessage('正在使用一次性接收码发送最近备份…');
     try {
       await credentialsForCurrentAccount();
       if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '请先完成一次归档导出');
       const code = $('#studio-pairing-code').value.trim();
       if (!code) throw new AppError(ERROR_CODES.INVALID_INPUT, '请粘贴 Studio 生成的一次性接收码');
       const result = await sendArchiveToStudio(code, lastArchive);
-      statusLabel.textContent = 'awaiting_confirmation';
-      setMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子。请回到 Studio 确认导入。`);
+      setStudioMessage(`发送成功：${result.preflight?.counts?.valid_items ?? '?'} 个有效帖子，请回到 Studio 确认导入。`);
       $('#studio-pairing-code').value = '';
     } catch (error) {
-      statusLabel.textContent = 'failed';
-      setMessage(error.message || '发送到 Studio 失败', true);
+      setStudioMessage(error.message || '发送到 Studio 失败', true);
     } finally {
-      setRunning(false);
+      setStudioBusy(false);
     }
   }
 
@@ -948,17 +1208,31 @@ export function mountToolkit({
     await credentialsForCurrentAccount();
     if (!lastArchive) throw new AppError(ERROR_CODES.INVALID_INPUT, '没有可重新下载的完成归档');
     downloadBlob(documentObject, lastArchive.blob, lastArchive.filename);
-    setMessage(`已重新下载 ${lastArchive.filename}`);
+    renderRecentExport(lastArchiveManifest, `已重新下载 ${lastArchive.filename}`);
+  }
+
+  async function discardResumableTask() {
+    if (!activeJobId || taskState !== 'paused') return;
+    if (!windowObject.confirm('放弃后将删除这次任务的断点，无法再继续。是否放弃？')) return;
+    await store.deleteJob(activeJobId);
+    activeJobId = null;
+    if (activeKind === 'import') {
+      importPreview = null;
+      renderImportPreview(null);
+    }
+    activeKind = null;
+    setMessage('');
+    setTaskStatus('idle');
   }
 
   function openPanel() {
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
-    $('.close').focus();
+    $('[data-action="export"]').focus();
     discoverResumableJob();
     refreshStudioConnection()
       .then((state) => watchStudioPairing(state))
-      .catch((error) => setMessage(error.message || '读取 Studio 关联状态失败', true));
+      .catch((error) => setStudioMessage(error.message || '读取 Studio 连接状态失败', true));
   }
 
   function closePanel() {
@@ -977,7 +1251,15 @@ export function mountToolkit({
       element.hidden = element.dataset.forScope !== event.target.value;
     });
     if (event.target.value === 'group') ensureBookmarks();
+    updateExportSummary();
   });
+  for (const selector of ['#include-comments', '#include-readable', '#reference-mode']) {
+    $(selector).addEventListener('change', updateExportSummary);
+  }
+  for (const selector of ['#bookmark', '#start-date', '#end-date']) {
+    $(selector).addEventListener('change', updateExportSummary);
+  }
+  $('#export-pids').addEventListener('input', updateExportSummary);
   shadow.querySelectorAll('[data-tab]').forEach((tab) => {
     tab.addEventListener('click', () => {
       shadow.querySelectorAll('[data-tab]').forEach((other) =>
@@ -992,18 +1274,15 @@ export function mountToolkit({
     lastExportOptions = exportOptions();
     runExport(lastExportOptions);
   });
-  deliveryDownload.addEventListener('change', archiveDestinations);
   deliveryStudio.addEventListener('change', archiveDestinations);
   $('[data-action="send-studio"]').addEventListener('click', () =>
     sendToTrustedStudio().catch((error) => {
-      statusLabel.textContent = 'failed';
-      setMessage(error.message || '发送到 Studio 失败', true);
+      setStudioMessage(error.message || '发送到 Studio 失败', true);
     }),
   );
   $('[data-action="send-studio-legacy"]').addEventListener('click', () =>
     sendToStudioWithCode().catch((error) => {
-      statusLabel.textContent = 'failed';
-      setMessage(error.message || '发送到 Studio 失败', true);
+      setStudioMessage(error.message || '发送到 Studio 失败', true);
     }),
   );
   studioPairButton.addEventListener('click', () => pairStudio());
@@ -1012,30 +1291,50 @@ export function mountToolkit({
     refreshStudioConnection()
       .then((state) => {
         watchStudioPairing(state);
-        if (state?.status === 'paired') setMessage('Studio 关联有效，可以直接发送。');
+        if (state?.status === 'paired') setStudioMessage('连接有效，可以发送最近备份。');
       })
-      .catch((error) => setMessage(error.message || '检查 Studio 关联失败', true)),
+      .catch((error) => setStudioMessage(error.message || '检查 Studio 连接失败', true)),
   );
   lastExportDownloadButton.addEventListener('click', () =>
-    downloadLastExport().catch((error) => setMessage(error.message, true)),
+    downloadLastExport().catch((error) => {
+      setTaskStatus('failed');
+      setMessage(error.message, true);
+    }),
   );
+  repeatExportButton.addEventListener('click', () => {
+    if (!lastExportOptions) return;
+    runExport(lastExportOptions);
+  });
+  $('#archive-files').addEventListener('change', () => {
+    importPreview = null;
+    renderImportPreview(null);
+    if (!isRunning) setTaskStatus('idle');
+  });
   $('[data-action="preview-import"]').addEventListener('click', () =>
     previewImport().catch((error) => {
-      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setTaskStatus(error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed');
       setMessage(error.message, true);
     }),
   );
   importExecuteButton.addEventListener('click', () =>
     executeImport().catch((error) => {
-      statusLabel.textContent = error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed';
+      setTaskStatus(error.code === ERROR_CODES.CANCELLED ? 'cancelled' : 'failed');
       setMessage(error.message, true);
     }),
   );
   pauseButton.addEventListener('click', () => {
     activeJob?.requestPause();
-    setMessage('将在当前洞处理完成后暂停…');
+    setMessage('将在当前帖子处理完成后安全暂停…');
   });
-  cancelButton.addEventListener('click', () => activeJob?.cancel());
+  cancelButton.addEventListener('click', () => {
+    if (activeJob) activeJob.cancel();
+    else {
+      discardResumableTask().catch((error) => {
+        setTaskStatus('failed');
+        setMessage(error.message || '无法删除任务断点', true);
+      });
+    }
+  });
   resumeButton.addEventListener('click', () => {
     if (activeKind === 'export') runExport(lastExportOptions, activeJobId);
     else if (activeKind === 'import') executeImport(activeJobId);
@@ -1045,6 +1344,10 @@ export function mountToolkit({
     else if (activeKind === 'import') executeImport(activeJobId);
   });
 
+  updateExportSummary();
+  renderImportPreview(null);
+  renderRecentExport();
+  renderControls();
   placeEntry();
   const fallbackTimer = setTimeout(placeEntry, 10_000);
   const Observer = windowObject.MutationObserver || globalThis.MutationObserver;
@@ -1080,6 +1383,7 @@ export function mountToolkit({
     reportError(error) {
       const record = toErrorRecord(error);
       openPanel();
+      setTaskStatus('failed');
       setMessage(record.message, true);
     },
   };

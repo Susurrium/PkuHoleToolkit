@@ -2,12 +2,108 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>PKU Hole Toolkit smoke fixture</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #f4f6f8;
+        color: #202124;
+      }
+      .fixture-guide {
+        box-sizing: border-box;
+        max-width: 920px;
+        margin: 20px auto;
+        padding: 16px;
+        border: 1px solid #d7dbe1;
+        border-radius: 12px;
+        background: #fff;
+      }
+      .fixture-guide h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      .fixture-guide p,
+      .fixture-guide li {
+        line-height: 1.55;
+      }
+      .scenarios {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-block: 12px;
+      }
+      .scenarios a {
+        padding: 6px 10px;
+        border: 1px solid #b9c0ca;
+        border-radius: 999px;
+        color: inherit;
+        text-decoration: none;
+      }
+      .scenarios a[aria-current="page"] {
+        border-color: #1a73e8;
+        background: #e8f0fe;
+        color: #174ea6;
+      }
+      .fixture-note {
+        padding: 10px 12px;
+        border-left: 4px solid #1a73e8;
+        background: #eef4ff;
+      }
+      #fixture-log {
+        max-height: 120px;
+        overflow: auto;
+        padding: 10px;
+        border-radius: 8px;
+        background: #f1f3f4;
+        white-space: pre-wrap;
+        font-size: 12px;
+      }
+      .toolbar {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        min-height: 48px;
+        padding-inline: 16px;
+        border-block: 1px solid #d7dbe1;
+        background: #fff;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background: #202124; color: #e8eaed; }
+        .fixture-guide, .toolbar { background: #292a2d; border-color: #5f6368; }
+        .fixture-note { background: #26344d; }
+        #fixture-log { background: #35363a; }
+        .scenarios a[aria-current="page"] { background: #2b4168; color: #d2e3fc; }
+      }
+    </style>
   </head>
   <body>
+    <aside class="fixture-guide" aria-labelledby="fixture-title">
+      <h1 id="fixture-title">Toolkit UI 冒烟夹具</h1>
+      <p class="fixture-note"><strong>完全本地：</strong>树洞 API、用户脚本私有存储和 Studio 请求均为 mock；真实写入会被拒绝，确认对话框也固定返回取消。</p>
+      <p>从仓库根目录运行 <code>python -m http.server 8000</code> 后访问本页。默认加载当前源码；构建后可加 <code>&amp;bundle=1</code> 检查生成的用户脚本。</p>
+      <nav class="scenarios" aria-label="冒烟场景">
+        <a href="?scenario=default" data-fixture-scenario="default">默认独立使用</a>
+        <a href="?scenario=paired" data-fixture-scenario="paired">已关联 Studio</a>
+        <a href="?scenario=running" data-fixture-scenario="running">可恢复任务</a>
+        <a href="?scenario=import-preview" data-fixture-scenario="import-preview">导入预检</a>
+      </nav>
+      <p id="fixture-description"></p>
+      <ul id="fixture-checks"></ul>
+      <p id="fixture-result" role="status">正在加载场景…</p>
+      <details>
+        <summary>查看 mock 请求</summary>
+        <pre id="fixture-log">尚无请求</pre>
+      </details>
+    </aside>
     <div class="toolbar">
       <div class="search-btn"><button type="button">搜索</button></div>
     </div>
-    <script src="../../PKU-Hole%20export%20tool.user.js"></script>
+    <script type="module" src="./smoke-harness.js"></script>
   </body>
 </html>

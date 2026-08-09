@@ -8,10 +8,12 @@ import {
   createResumableJobDiscovery,
   deliverArchiveToDestinations,
   ensureEntryBeforeAnchor,
+  exportSummaryText,
   normalizeArchiveDestinations,
   readArchiveDestinations,
   reconcileAccountScopedState,
   selectLatestResumableJob,
+  taskStatusText,
   writeArchiveDestinations,
 } from '../apps/userscript/src/ui.js';
 
@@ -60,6 +62,20 @@ test('UI bootstrap does not overwrite host onload and uses an idempotent entry i
     ui,
     /refreshStudioDevicePairing/,
     'pending pairing refreshes must use the cancellable watcher',
+  );
+});
+
+test('task states and export options are presented in user language', () => {
+  assert.equal(taskStatusText('planning'), '正在读取备份范围');
+  assert.equal(taskStatusText('completed', 'import'), '迁移完成');
+  assert.equal(
+    exportSummaryText({
+      scope: { type: 'date' },
+      includeComments: true,
+      includeReadable: true,
+      referenceMode: 'none',
+    }),
+    '按帖子发布日期 · 包含评论 · 不补全引用 · 附带阅读版',
   );
 });
 

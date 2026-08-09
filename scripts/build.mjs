@@ -7,12 +7,12 @@ const packageJson = JSON.parse(
 
 const metadata = `// ==UserScript==
 // @name         PKU-Hole export tool
-// @name:zh-CN   北大树洞归档与关注迁移工具
+// @name:zh-CN   北大树洞本地备份与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
 // @version      ${packageJson.version}
 // @license      MIT
-// @description  安全、可恢复地导入/导出北大树洞关注列表
+// @description  独立完成北大树洞本地备份与关注迁移，可选联动 PkuHoleStudio
 // @match        https://treehole.pku.edu.cn/web/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
