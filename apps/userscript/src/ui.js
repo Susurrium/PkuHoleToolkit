@@ -174,6 +174,7 @@ export function exportSummaryText(options = {}) {
   };
   const parts = [scopeLabels[options.scope?.type] || '全部关注'];
   parts.push(options.includeComments === false ? '不含评论' : '包含评论');
+  parts.push(options.includeMedia === false ? '不含图片' : '包含图片');
   if (options.referenceMode === 'body') parts.push('补全正文引用');
   else if (options.referenceMode === 'all') parts.push('补全正文和评论引用');
   else parts.push('不补全引用');
@@ -331,14 +332,15 @@ function panelTemplate() {
             <details class="disclosure" data-export-options>
               <summary>更多备份选项</summary>
               <div class="disclosure-body">
-                <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>附带可直接阅读的文本</label></div>
+                <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-media" type="checkbox" checked>备份图片（含所选评论中的图片）</label><label><input id="include-readable" type="checkbox" checked>附带可直接阅读的文本</label></div>
+                <p class="hint">图片保留原始文件。单张最多 50 MiB，图片合计最多 180 MiB；超限或下载失败会列为缺失，仍可保存已完成的内容。较大的备份请按分组或日期分次进行。</p>
                 <div class="field"><label for="reference-mode">补全一层引用内容</label><select id="reference-mode"><option value="none">不补全引用</option><option value="body">补全正文中的引用</option><option value="all">补全正文和评论中的引用</option></select></div>
                 <p class="hint">补全引用可能加入所选范围之外的帖子，并增加请求数量。</p>
               </div>
             </details>
             <input id="delivery-download" type="checkbox" checked hidden aria-hidden="true">
             <div class="actions primary-actions"><button class="primary" type="button" data-action="export">生成并下载备份</button></div>
-            <p class="hint">每次都会生成一份新的完整快照；生成后仍可重新下载。</p>
+            <p class="hint">每次都会生成一份新的备份；未完成内容会明确标注，生成后仍可重新下载。</p>
 
             <div class="result-card" data-recent-export hidden>
               <h3>最近备份</h3>
@@ -591,9 +593,10 @@ export function mountToolkit({
       return;
     }
     const counts = manifest?.counts;
-    $('[data-recent-export-summary]').textContent = note || (counts
-      ? `${manifest.complete ? '备份完成' : '部分备份'}：${counts.exportedHoles} 个帖子、${counts.comments} 条评论。`
-      : '最近生成的备份可以直接重新下载，不需要再次抓取。');
+    const summary = counts
+      ? `${manifest.complete ? '备份完成' : '部分备份'}：${counts.exportedHoles} 个帖子、${counts.comments} 条评论${counts.media !== undefined ? `、${counts.media - counts.missingMedia} 张图片已保存、${counts.missingMedia} 张缺失` : ''}。`
+      : '最近生成的备份可以直接重新下载，不需要再次抓取。';
+    $('[data-recent-export-summary]').textContent = note ? `${note} ${summary}` : summary;
     $('[data-recent-export-filename]').textContent = lastArchive.filename || '';
     studioSendButton.hidden = studioBridgeState?.status !== 'paired';
     renderControls();
@@ -729,6 +732,10 @@ export function mountToolkit({
   }
 
   function handleProgress(event) {
+    if (event.type === 'media') {
+      setMessage(`正在保存 #${event.pid} 的图片：${event.mediaAvailable} 张已保存、${event.mediaMissing} 张未保存，共 ${(event.mediaBytes / (1024 * 1024)).toFixed(1)} MiB`);
+      return;
+    }
     const total = Number(event.total || 0);
     const completed = Number(event.completed || event.count || 0);
     progress.max = Math.max(1, total);
@@ -783,10 +790,8 @@ export function mountToolkit({
       try {
         const { credentials } = await credentialsForCurrentAccount();
         if (activeJob || isRunning) return null;
-        const [restored, jobs] = await Promise.all([
-          restoreLatestExportArchive(store, credentials.accountFingerprint),
-          store.listJobs(),
-        ]);
+        const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
+        const jobs = await store.listJobs();
         if (activeJob || isRunning) return null;
         if (restored) {
           lastArchive = restored.archive;
@@ -837,6 +842,7 @@ export function mountToolkit({
       scope,
       includeComments: $('#include-comments').checked,
       includeReadable: $('#include-readable').checked,
+      includeMedia: $('#include-media').checked,
       referenceMode: $('#reference-mode').value,
     };
   }
@@ -902,6 +908,7 @@ export function mountToolkit({
           windowObject.confirm(`检测到 ${count} 个引用洞，是否继续抓取？`),
       });
       const result = await activeJob.run(options, { jobId });
+      lastExportOptions = result.job.options;
       activeJobId = result.job.id;
       if (result.paused) {
         setTaskStatus('paused');
@@ -918,7 +925,7 @@ export function mountToolkit({
           ? '备份完成，浏览器下载已经开始。'
           : '备份已经生成，但浏览器没有启动下载；可以点击“重新下载”。'
         : `已生成部分备份，${result.manifest.errors.length} 项未完成；可以先下载，也可以重试。`;
-      renderRecentExport(result.manifest, archiveMessage);
+      renderRecentExport(result.manifest);
       setMessage(archiveMessage, !result.manifest.complete || delivery.download === 'failed');
       if (delivery.studio === 'awaiting_confirmation') {
         setStudioMessage(
@@ -933,7 +940,7 @@ export function mountToolkit({
       const cancelled = error.code === ERROR_CODES.CANCELLED;
       setMessage(cancelled ? '备份已取消。' : error.message || '备份失败', !cancelled);
       setTaskStatus(
-        cancelled ? 'cancelled' : error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed',
+        cancelled ? 'cancelled' : [ERROR_CODES.RATE_LIMITED, ERROR_CODES.STORAGE_ERROR, ERROR_CODES.UNAUTHORIZED].includes(error.code) ? 'paused' : 'failed',
       );
     } finally {
       activeJob = null;
@@ -1253,7 +1260,7 @@ export function mountToolkit({
     if (event.target.value === 'group') ensureBookmarks();
     updateExportSummary();
   });
-  for (const selector of ['#include-comments', '#include-readable', '#reference-mode']) {
+  for (const selector of ['#include-comments', '#include-media', '#include-readable', '#reference-mode']) {
     $(selector).addEventListener('change', updateExportSummary);
   }
   for (const selector of ['#bookmark', '#start-date', '#end-date']) {

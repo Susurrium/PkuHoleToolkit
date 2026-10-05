@@ -1,5 +1,6 @@
 import { JOB_DB_NAME, JOB_DB_VERSION, JOB_RETENTION_MS } from './config.js';
 import { AppError, ERROR_CODES } from './errors.js';
+import { mediaTargetKey } from './media.js';
 
 function cloneValue(value) {
   if (value === undefined) return undefined;
@@ -44,8 +45,20 @@ export class JobStore {
           const store = database.createObjectStore('items', { keyPath: 'key' });
           store.createIndex('jobId', 'jobId', { unique: false });
         }
+        for (const name of ['media', 'mediaFiles']) {
+          if (!database.objectStoreNames.contains(name)) {
+            const store = database.createObjectStore(name, { keyPath: 'key' });
+            store.createIndex('jobId', 'jobId', { unique: false });
+          }
+        }
       };
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        request.result.onversionchange = () => {
+          request.result.close();
+          this.databasePromise = null;
+        };
+        resolve(request.result);
+      };
       request.onerror = () => reject(request.error);
     });
     return this.databasePromise;
@@ -76,15 +89,19 @@ export class JobStore {
   }
 
   async putItem(jobId, pid, item) {
-    const database = await this.open();
-    const transaction = database.transaction('items', 'readwrite');
-    transaction.objectStore('items').put({
-      key: `${jobId}:${pid}`,
-      jobId,
-      pid: String(pid),
-      item: cloneValue(item),
-    });
-    await transactionPromise(transaction);
+    try {
+      const database = await this.open();
+      const transaction = database.transaction('items', 'readwrite');
+      transaction.objectStore('items').put({
+        key: `${jobId}:${pid}`,
+        jobId,
+        pid: String(pid),
+        item: cloneValue(item),
+      });
+      await transactionPromise(transaction);
+    } catch (error) {
+      throw new AppError(ERROR_CODES.STORAGE_ERROR, '无法保存正文或评论进度，浏览器存储可能已满', { cause: error });
+    }
   }
 
   async getItems(jobId) {
@@ -95,18 +112,45 @@ export class JobStore {
     return records.map((record) => record.item);
   }
 
+  async putMedia(jobId, record, bytes = null) {
+    try {
+      const database = await this.open();
+      const transaction = database.transaction(['media', 'mediaFiles'], 'readwrite');
+      transaction.objectStore('media').put({ key: `${jobId}:${mediaTargetKey(record)}`, jobId, record: cloneValue(record) });
+      if (bytes) transaction.objectStore('mediaFiles').put({ key: `${jobId}:${record.sha256}`, jobId, bytes });
+      await transactionPromise(transaction);
+    } catch (error) {
+      throw new AppError(ERROR_CODES.STORAGE_ERROR, '无法保存图片，浏览器存储可能已满；已保存的断点仍可恢复', { cause: error });
+    }
+  }
+
+  async getMedia(jobId) {
+    const database = await this.open();
+    const transaction = database.transaction('media', 'readonly');
+    const records = await requestPromise(transaction.objectStore('media').index('jobId').getAll(IDBKeyRange.only(jobId)));
+    return records.map((record) => record.record);
+  }
+
+  async getMediaFile(jobId, sha256) {
+    const database = await this.open();
+    const transaction = database.transaction('mediaFiles', 'readonly');
+    const record = await requestPromise(transaction.objectStore('mediaFiles').get(`${jobId}:${sha256}`));
+    return record?.bytes || null;
+  }
+
   async deleteJob(jobId) {
     const database = await this.open();
-    const transaction = database.transaction(['jobs', 'items'], 'readwrite');
+    const transaction = database.transaction(['jobs', 'items', 'media', 'mediaFiles'], 'readwrite');
     transaction.objectStore('jobs').delete(jobId);
-    const index = transaction.objectStore('items').index('jobId');
-    const request = index.openKeyCursor(IDBKeyRange.only(jobId));
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (!cursor) return;
-      transaction.objectStore('items').delete(cursor.primaryKey);
-      cursor.continue();
-    };
+    for (const name of ['items', 'media', 'mediaFiles']) {
+      const request = transaction.objectStore(name).index('jobId').openKeyCursor(IDBKeyRange.only(jobId));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        transaction.objectStore(name).delete(cursor.primaryKey);
+        cursor.continue();
+      };
+    }
     await transactionPromise(transaction);
   }
 
@@ -124,6 +168,8 @@ export class MemoryJobStore {
     this.now = now;
     this.jobs = new Map();
     this.items = new Map();
+    this.media = new Map();
+    this.mediaFiles = new Map();
   }
 
   async putJob(job) {
@@ -149,10 +195,26 @@ export class MemoryJobStore {
       .map(([, item]) => cloneValue(item));
   }
 
+  async putMedia(jobId, record, bytes = null) {
+    this.media.set(`${jobId}:${mediaTargetKey(record)}`, { jobId, record: cloneValue(record) });
+    if (bytes) this.mediaFiles.set(`${jobId}:${record.sha256}`, { jobId, bytes: bytes.slice() });
+  }
+
+  async getMedia(jobId) {
+    return [...this.media.values()].filter((value) => value.jobId === jobId).map((value) => cloneValue(value.record));
+  }
+
+  async getMediaFile(jobId, sha256) {
+    return this.mediaFiles.get(`${jobId}:${sha256}`)?.bytes.slice() || null;
+  }
+
   async deleteJob(jobId) {
     this.jobs.delete(jobId);
     for (const key of this.items.keys()) {
       if (key.startsWith(`${jobId}:`)) this.items.delete(key);
+    }
+    for (const records of [this.media, this.mediaFiles]) {
+      for (const [key, value] of records) if (value.jobId === jobId) records.delete(key);
     }
   }
 

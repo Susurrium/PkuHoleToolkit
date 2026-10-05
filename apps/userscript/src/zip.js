@@ -74,9 +74,10 @@ function safeArchiveName(name) {
   return normalized;
 }
 
-export function createZip(entries, date = new Date()) {
+export function createZip(entries, date = new Date(), { maxBytes = Infinity } = {}) {
   const localParts = [];
   const centralParts = [];
+  let entryCount = 0;
   let localOffset = 0;
   const dos = dosDateTime(date);
 
@@ -98,8 +99,7 @@ export function createZip(entries, date = new Date()) {
       ...uint16(nameBytes.length),
       ...uint16(0),
     ]);
-    const localRecord = concatBytes([localHeader, nameBytes, data]);
-    localParts.push(localRecord);
+    localParts.push(localHeader, nameBytes, data);
 
     const centralHeader = new Uint8Array([
       ...uint32(ZIP_SIGNATURES.CENTRAL),
@@ -121,9 +121,15 @@ export function createZip(entries, date = new Date()) {
       ...uint32(localOffset),
     ]);
     centralParts.push(concatBytes([centralHeader, nameBytes]));
-    localOffset += localRecord.length;
+    localOffset += localHeader.length + nameBytes.length + data.length;
+    entryCount += 1;
+    if (entryCount > 65_535) throw new AppError(ERROR_CODES.INVALID_INPUT, '归档文件数量超过 ZIP 上限');
   }
 
+  const centralSize = centralParts.reduce((size, part) => size + part.length, 0);
+  if (localOffset + centralSize + 22 > maxBytes) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档超过 200 MiB 上限，请缩小备份范围或取消图片备份；已保存的断点仍保留');
+  }
   const centralDirectory = concatBytes(centralParts);
   const end = new Uint8Array([
     ...uint32(ZIP_SIGNATURES.END),

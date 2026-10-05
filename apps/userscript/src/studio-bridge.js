@@ -1,4 +1,4 @@
-import { createArchive, parseArchiveBytes } from './archive.js';
+import { createStoredExportArchive, parseArchiveBytes } from './archive.js';
 import { AppError, ERROR_CODES } from './errors.js';
 
 const BRIDGE_PROTOCOL = '2';
@@ -382,14 +382,13 @@ export async function restoreLatestExportArchive(store, accountFingerprint = nul
   if (!job) return null;
   const items = await store.getItems(job.id);
   if (!items.length) return null;
-  return {
-    job,
-    archive: createArchive({
-      manifest: job.manifest,
-      items,
-      includeReadable: job.options?.includeReadable !== false,
-    }),
-  };
+  const archive = await createStoredExportArchive(store, job, items);
+  const restoredJob = { ...job, manifest: archive.manifest };
+  if (job.manifest.complete && !archive.manifest.complete) {
+    Object.assign(restoredJob, { state: 'partial', errors: archive.manifest.errors });
+    await store.putJob(restoredJob);
+  }
+  return { job: restoredJob, archive };
 }
 
 export function createStudioBridgeStorage({

@@ -32,6 +32,7 @@ const modules = [
   'errors.js',
   'credentials.js',
   'scheduler.js',
+  'media.js',
   'api.js',
   'zip.js',
   'archive.js',

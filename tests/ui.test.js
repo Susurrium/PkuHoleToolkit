@@ -75,7 +75,7 @@ test('task states and export options are presented in user language', () => {
       includeReadable: true,
       referenceMode: 'none',
     }),
-    '按帖子发布日期 · 包含评论 · 不补全引用 · 附带阅读版',
+    '按帖子发布日期 · 包含评论 · 包含图片 · 不补全引用 · 附带阅读版',
   );
 });
 

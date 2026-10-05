@@ -1,6 +1,7 @@
-import { API_BASE, LIMITS, PID_PATTERN } from './config.js';
+import { API_BASE, API_ORIGIN, LIMITS, PID_PATTERN } from './config.js';
 import { createAuthHeaders } from './credentials.js';
 import { AppError, ERROR_CODES, isAppError } from './errors.js';
+import { readMediaResponse } from './media.js';
 
 export function normalizePid(value) {
   const pid = String(value ?? '').trim();
@@ -81,6 +82,39 @@ export class TreeholeApi {
     });
   }
 
+  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes) {
+    const pid = normalizePid(pidValue);
+    const id = String(remoteId ?? '').trim();
+    if (id && !/^\d+$/.test(id)) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '媒体 ID 无效');
+    }
+    const url = new URL('/chapi/api/v3/media/getImageBinary', API_ORIGIN);
+    url.searchParams.set(id ? 'id' : 'pid', id || pid);
+    const beforeAttempt = async () => {
+      const credentials = await this.credentialsProvider();
+      if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，媒体任务已停止', {
+          operation: 'download_media',
+        });
+      }
+      return { headers: createAuthHeaders(credentials, { accept: 'image/*, application/octet-stream' }) };
+    };
+    const options = await beforeAttempt();
+    return this.scheduler.requestBinary(url.href, {
+      ...options,
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'error',
+      referrer: `${API_ORIGIN}/web/`,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+    }, {
+      operation: 'download_media',
+      signal,
+      beforeAttempt,
+      readBody: (response) => readMediaResponse(response, maxBytes),
+    });
+  }
+
   async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
     const credentials = await this.credentialsProvider();
     if (
@@ -139,10 +173,16 @@ export class TreeholeApi {
 
   async getHole(pidValue, signal) {
     const pid = normalizePid(pidValue);
-    return this.request(`/pku/${encodeURIComponent(pid)}/`, {
+    const hole = await this.request(`/pku/${encodeURIComponent(pid)}/`, {
       signal,
       operation: 'get_hole',
     });
+    if (!hole || Array.isArray(hole) || String(hole.pid) !== pid) {
+      throw new AppError(ERROR_CODES.INVALID_RESPONSE, `#${pid} 详情响应的帖子编号不一致`, {
+        operation: 'get_hole',
+      });
+    }
+    return hole;
   }
 
   async getAllFollowed({ bookmarkId = null, signal, onPage = () => {} } = {}) {

@@ -17,7 +17,7 @@ test('reference parser supports hash references and API-normalized leading PIDs'
   assert.deepEqual(referencesFromText('ordinary text with 8395003 in the middle'), []);
 });
 
-test('export job skips comments for zero replies and produces a complete archive', async () => {
+test('export job checks comments for zero replies and exports fresh detail references', async () => {
   let commentCalls = 0;
   const api = {
     scheduler: { resetRateLimitCount() {} },
@@ -35,7 +35,7 @@ test('export job skips comments for zero replies and produces a complete archive
       return { complete: true, items: [{ cid: 1, pid, name: 'Alice', text: 'hello' }] };
     },
     async getHole(pid) {
-      return { pid: Number(pid), text: 'reference', reply: 0, timestamp: 3 };
+      return { pid: Number(pid), text: pid === '123456' ? 'first #345678' : 'detail', reply: 0, timestamp: 3 };
     },
   };
   const store = new MemoryJobStore({ now: () => 1 });
@@ -50,7 +50,7 @@ test('export job skips comments for zero replies and produces a complete archive
     includeComments: true,
     referenceMode: 'body',
   });
-  assert.equal(commentCalls, 1);
+  assert.equal(commentCalls, 3);
   assert.equal(result.manifest.complete, true);
   assert.equal(result.manifest.counts.exportedHoles, 3);
   assert.equal(parseArchiveBytes(result.archive.bytes).data.items.length, 3);
@@ -68,6 +68,8 @@ test('export job can pause and resume without duplicating completed items', asyn
         ],
       };
     },
+    async getHole(pid) { return { pid, reply: 0, timestamp: 1 }; },
+    async getAllComments() { return { complete: true, items: [] }; },
   };
   const store = new MemoryJobStore();
   let instance;
@@ -520,7 +522,7 @@ test('import resume uses the preview and PID list saved in its checkpoint', asyn
   assert.equal(result.audit.totalFiles, 1);
 });
 
-test('a 2000-hole export completes without comment requests when reply count is zero', async () => {
+test('a 2000-hole export checks detail and comments even when listed replies are zero', async () => {
   const holes = Array.from({ length: 2000 }, (_, index) => ({
     pid: 10000 + index,
     text: `hole ${index}`,
@@ -528,10 +530,15 @@ test('a 2000-hole export completes without comment requests when reply count is 
     timestamp: index + 1,
   }));
   let commentCalls = 0;
+  let detailCalls = 0;
   const api = {
     scheduler: { resetRateLimitCount() {} },
     async getAllFollowed() {
       return { complete: true, items: holes };
+    },
+    async getHole(pid) {
+      detailCalls += 1;
+      return holes.find((hole) => String(hole.pid) === pid);
     },
     async getAllComments() {
       commentCalls += 1;
@@ -546,5 +553,6 @@ test('a 2000-hole export completes without comment requests when reply count is 
   const result = await job.run({ scope: { type: 'all' }, referenceMode: 'none' });
   assert.equal(result.manifest.counts.exportedHoles, 2000);
   assert.equal(result.manifest.complete, true);
-  assert.equal(commentCalls, 0);
+  assert.equal(commentCalls, 2000);
+  assert.equal(detailCalls, 2000);
 });

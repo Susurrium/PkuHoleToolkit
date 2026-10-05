@@ -88,11 +88,19 @@ export class RequestScheduler {
       context.signal?.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => controller.abort('timeout'), this.policy.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, { ...options, signal: controller.signal });
+        const refreshed = await context.beforeAttempt?.();
+        throwIfAborted(context.signal, context.operation);
+        const response = await this.fetchImpl(url, { ...options, ...refreshed, signal: controller.signal });
         let body;
         try {
-          body = await response.json();
+          if (response.ok && context.readBody) body = await context.readBody(response);
+          else if (context.readBody) {
+            await response.body?.cancel?.();
+            body = null;
+          } else body = await response.json();
         } catch (error) {
+          if (error instanceof AppError) throw error;
+          if (controller.signal.aborted || context.readBody) throw error;
           if (!response.ok) body = null;
           else {
             throw new AppError(ERROR_CODES.INVALID_RESPONSE, '服务器返回了无法解析的数据', {
@@ -125,10 +133,20 @@ export class RequestScheduler {
   }
 
   async requestJson(url, options = {}, context = {}) {
+    return this.request(url, options, context);
+  }
+
+  async requestBinary(url, options = {}, context = {}) {
+    return this.request(url, options, { ...context, kind: 'read' });
+  }
+
+  async request(url, options = {}, context = {}) {
     const normalized = {
       operation: context.operation || 'request',
       kind: context.kind === 'write' ? 'write' : 'read',
       signal: context.signal,
+      readBody: context.readBody,
+      beforeAttempt: context.beforeAttempt,
     };
     const maxAttempts =
       normalized.kind === 'write' ? 1 : Math.max(1, this.policy.maxReadAttempts);

@@ -6,12 +6,21 @@ import { parseArchiveBytes } from '../apps/userscript/src/archive.js';
 import { MemoryJobStore } from '../apps/userscript/src/storage.js';
 
 function createJob(overrides = {}) {
+  let plannedHoles = [];
   const api = {
     scheduler: { resetRateLimitCount() {} },
     async getAllFollowed() {
       return { complete: true, items: [] };
     },
+    async getHole(pid) { return plannedHoles.find((hole) => String(hole.pid) === pid); },
+    async getAllComments() { return { complete: true, items: [] }; },
     ...overrides,
+  };
+  const listFollowed = api.getAllFollowed;
+  api.getAllFollowed = async (options) => {
+    const result = await listFollowed(options);
+    plannedHoles = result.items;
+    return result;
   };
   return new ExportJob({
     api,

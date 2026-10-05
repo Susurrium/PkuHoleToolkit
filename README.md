@@ -1,93 +1,199 @@
 # PKU Treehole Toolkit
 
-一个可以独立使用的北大树洞本地备份与关注迁移用户脚本。
+**把北大树洞的帖子、评论和图片保存到自己的电脑，也可以在换账号时从备份迁移关注。**
 
-Toolkit 直接运行在树洞官网中：你可以把当前账号关注的树洞保存为本地 `.treehole.zip`，也可以在换号时只迁移尚未关注的帖子。导出不修改关注、帖子或评论；使用本地备份不需要安装任何其他软件。
+Toolkit 是运行在[树洞网页版](https://treehole.pku.edu.cn/web/)中的用户脚本。安装油猴和 Toolkit 后即可使用，无需编程或部署服务；本地备份和关注迁移都能独立完成。[PkuHoleStudio](https://github.com/Susurrium/PkuHoleStudio) 是可选的桌面端联动。
 
-PkuHoleStudio 是可选的本机桌面端联动。已经使用 Studio 的用户可以把同一份备份直接发送到桌面端继续管理；不了解或不使用 Studio 的用户可以完全忽略它，Toolkit 的本地备份、任务恢复和关注迁移均可独立工作。
+**[安装 v1.5.0](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.5.0/PKU-Hole%20export%20tool.user.js)** · [正式版下载与更新记录](https://github.com/Susurrium/PkuHoleToolkit/releases/latest) · [反馈问题](https://github.com/Susurrium/PkuHoleToolkit/issues)
 
-## 最短使用路径
+第一次使用请从[安装与首次使用](#安装与首次使用)开始；想阅读或修改代码，可以直接跳到[开发与贡献](#开发与贡献)。
 
-### 备份到本机
+[功能](#你可以用它做什么) · [安装](#安装与首次使用) · [备份](#保存一份备份) · [迁移](#从备份迁移关注) · [Studio](#可选连接-pkuholestudio) · [常见问题](#常见问题) · [隐私](#数据与隐私) · [开发](#开发与贡献)
 
-1. 安装脚本并登录 `https://treehole.pku.edu.cn/web/`。
-2. 打开页面工具栏中的 Toolkit 入口。
-3. 选择备份范围；一般直接使用“全部关注”。
-4. 按需决定是否包含评论、可读文本和一层引用内容，然后开始生成备份。
-5. 浏览器会下载一个 `.treehole.zip` 文件。请把它保存在可信的位置；需要时可以重新下载最近生成的备份。
+## 你可以用它做什么
 
-导出的 ZIP 包含机器可读数据，并可选包含便于直接查看的 `readable.txt`。大批量任务可以暂停、取消，并在七天内从断点继续；部分失败时只需重试未完整项目。
+- **保存内容：** 默认备份帖子正文、评论和图片，附带可直接阅读的文本；图片保留原始文件，包括 GIF 动画。
+- **选择范围：** 备份全部关注、某个收藏分组、指定帖子，或按帖子发布日期筛选关注内容。
+- **补全上下文：** 按需保存正文或评论中引用的另一层帖子。
+- **继续长任务：** 支持暂停、七天内恢复、重试未完成项，以及重新下载最近备份。
+- **迁移关注：** 在新账号检查旧备份，确认后只新增尚未关注的帖子。
 
-### 换号迁移关注
+v1.5.0 新增图片备份，并改进评论抓取：开启评论时会实际检查评论接口，避免官网显示的回复数不准确时漏抓。完整变化见 [CHANGELOG](./CHANGELOG.md)。
 
-1. 先在旧账号中生成并保存备份。
-2. 登录要接收关注的新账号，打开 Toolkit 的关注迁移入口。
-3. 选择 Toolkit ZIP，或旧版 `{ holes, comments }` JSON，然后点击“检查备份”。
-4. 核对“将新增”和“已关注”数量后再确认迁移。
+## 安装与首次使用
 
-迁移只会向当前登录账号新增尚未关注的 PID，不会取消或覆盖已有关注，也不会把正文、评论重新发布到树洞。归档中的 `referenced` 引用上下文不会被关注；检查未能完整读取当前关注列表时，Toolkit 会禁止执行写入。
+### 1. 安装油猴
 
-### 可选：发送到 PkuHoleStudio
+在浏览器中安装 [Tampermonkey（油猴）](https://www.tampermonkey.net/)，也可以使用 [Violentmonkey](https://violentmonkey.github.io/)。已有脚本管理器的用户可直接进行下一步。
 
-如果已经安装 PkuHoleStudio，可以在 Toolkit 中主动关联本机 Studio，并把生成的同一份备份发送过去；也可以同时保留浏览器下载。Toolkit 未选择 Studio 时不会连接本机端口。
+第一次使用油猴，可以参考 Arthals 的 **[PKU Art 安装图文教程](https://arthals.ink/blog/pku-art#安装)**，了解浏览器扩展的安装和设置。该文章介绍的是另一个脚本；完成油猴安装后，请返回本页安装 Toolkit。文章中的 PKU Art 安装链接和录播下载设置不是 Toolkit 的安装步骤，Toolkit 无需设置油猴的“下载 BETA”模式。
 
-首次持续关联需要在 Studio 中核对一次，之后发送无需反复复制接收码。发送前 Toolkit 会协商 Studio 支持的归档 schema、扩展和文件大小，上传后仍由 Studio 预检，再由用户确认导入。旧版一次性接收码继续作为兼容入口。
+Chrome / Edge 等浏览器可能需要额外允许执行用户脚本。按扩展设置开启“允许运行用户脚本”或对应的开发者模式，具体以 [Tampermonkey 官方说明](https://www.tampermonkey.net/faq.php?q=Q209)为准。
 
-## 功能范围
+### 2. 安装 Toolkit
 
-- 从当前登录账号备份全部关注、指定收藏分组、指定 PID 或日期范围；日期按帖子发布时间和浏览器本地自然日筛选，并包含首尾。
-- 可选择正文、评论，以及正文或评论中的一层 `#PID` 引用。
-- 默认生成一个 `.treehole.zip`，包含 `manifest.json`、`data.json` 和可选的 `readable.txt`。
-- 支持暂停、取消、七天内恢复，以及只重试未完整项目；最近完成的备份可重新下载。
-- 支持导入新版 ZIP 和旧版 `{ holes, comments }` JSON；执行前会预检、合并去重并二次确认。
-- 单次关注 POST 不自动重试。用户手动重试未完整项时，Toolkit 会先读取当前状态，确认仍未关注才重新尝试，并再次核对最终状态。
-- 可选发送到已关联 PkuHoleStudio。Studio 不可用或发送失败不会影响已经完成的本地备份。
+打开 **[Toolkit v1.5.0 安装链接](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.5.0/PKU-Hole%20export%20tool.user.js)**，在脚本管理器弹出的页面中确认安装。
 
-## 安装
+如果没有弹出安装页面，可以到[正式版发布页](https://github.com/Susurrium/PkuHoleToolkit/releases/latest)下载附件 `PkuHoleToolkit-1.5.0.user.js`，然后通过脚本管理器的文件导入功能安装。不要下载名为 `Source code` 的源码包来安装。
 
-当前正式版本为 `v1.4.1`。可从 [GitHub Release](https://github.com/Susurrium/PkuHoleToolkit/releases/tag/v1.4.1) 获取命名后的 `.user.js` 附件；安装前请先禁用旧版同名脚本。真实环境验收记录见 [`BETA_TEST_CHECKLIST.md`](./BETA_TEST_CHECKLIST.md)。
+升级或替换旧脚本后，请确认同类树洞导出脚本只启用一个，避免重复运行。脚本管理器中的中文名称是“北大树洞本地备份与关注迁移工具”，英文名称是 `PKU-Hole export tool`。
 
-1. 安装 Tampermonkey 或 Violentmonkey。
-2. 打开根目录生成文件 `PKU-Hole export tool.user.js` 并安装。
-3. 登录 `https://treehole.pku.edu.cn/web/`，工具会在搜索按钮附近显示入口。
+### 3. 打开树洞
 
-如果官网工具栏尚未出现，脚本会在 10 秒后显示右下角浮动入口。
+登录[树洞网页版](https://treehole.pku.edu.cn/web/)，刷新页面，然后点击搜索按钮附近的 **“树洞备份”**。
 
-## 安全与隐私
+如果工具栏无法挂载入口，脚本会在约 10 秒后显示右下角浮动按钮。首次使用建议先选择一个较小的收藏分组，熟悉操作和下载结果。
 
-- 本地导出只读取树洞数据，不会修改关注、发帖或评论。关注迁移必须先检查备份并由用户确认，且只新增当前账号尚未关注的 PID。
-- 树洞数据请求仅访问 `https://treehole.pku.edu.cn/api/*`。只有用户主动选择 Studio 联动时，脚本才会把归档 ZIP 发送到本机 `http://127.0.0.1:<端口>`；不会向 Studio 发送树洞账号、Cookie、token 或 UUID。
-- token、Cookie 和原始 UUID 不写入 IndexedDB 或归档。IndexedDB 任务记录只保存不可逆账号指纹，用于阻止跨账号恢复断点；该指纹不会写入 ZIP。
-- Studio 持续关联使用浏览器生成的 ECDSA P-256 设备密钥：私钥只保存在用户脚本管理器的私有存储中，Studio 只保存公钥。每次传输仍使用短时、一次性且绑定文件名、大小和 SHA-256 的签名票据，任一端均可撤销关联。
-- 兼容旧版的一次性接收码等待上传 15 分钟，收到文件后另有 30 分钟供用户核对；它不是永久凭据。
-- 归档包含用户关注内容和评论，可能十分敏感。请将文件保存在可信设备中，不要随意上传到第三方网站或公共云盘。
-- 请勿在多个标签页同时启动大批量任务。遇到 429、401 或 403 时任务会暂停或停止，不要通过提高并发绕过服务端限制。
+## 保存一份备份
 
-## 归档与兼容性
+### 开始备份
 
-Toolkit 使用 PkuHole Archive Contract 2.1.0。Archive 2.1 以 ZIP STORE 作为 Toolkit 和 Studio 都能读取的写入基线，并通过双方真实导出黄金包持续执行互操作测试；能力协商结果按 Studio 实例短时缓存。
+1. 打开“树洞备份”，进入 **“备份到本机”**。
+2. 选择“备份范围”。保存全部关注时保持默认；也可以选择某个收藏分组、指定帖子 PID（帖子编号）或按帖子发布日期筛选。
+3. 默认包含评论、图片和阅读文本；需要调整时展开 **“更多备份选项”**。
+4. 点击 **“生成并下载备份”**，等待任务完成。长任务期间请保留页面，并避免在多个标签页同时启动备份。
+5. 浏览器会下载一个以 `.treehole.zip` 结尾的文件。查看完成提示和缺失数量，再把文件保存在自己的电脑中。
 
-归档协议以独立的 `PkuHoleArchiveSpec` 为中立真源。本仓库在 `packages/archive-schema` 固定并内置 2.1.0 Schema 与契约 fixtures，Toolkit 运行时不依赖 Studio 或 Spec 仓库。
+日期筛选针对关注帖子的**发布时间**，不是关注时间；采用浏览器所在时区的自然日，包含开始和结束日期。指定 PID 则可以读取当前账号有权访问的帖子，不要求已经关注。
 
-## 开发
+### 查看下载的文件
 
-要求 Node.js 24 或兼容版本。项目无第三方运行时或构建依赖。
+`.treehole.zip` 是普通 ZIP 文件，解压后即可查看：
 
-```powershell
+| 文件 | 用途 |
+| --- | --- |
+| `readable.txt` | 用文本编辑器打开，阅读帖子和评论；默认生成，关闭阅读文本选项后不生成 |
+| `media/` | 已保存的图片原始文件，存在图片备份数据时生成；可使用支持对应格式的图片查看器打开 |
+| `media/index.json` | 记录图片与帖子、评论的对应关系，以及缺失情况 |
+| `data.json`、`manifest.json` | 供工具读取的内容、备份范围和完成情况；迁移时无需手动编辑 |
+
+**阅读文本会列出图片文件路径，图片不会直接嵌在文本中。** 需要迁移关注或导入其他工具时，保留原始 ZIP，直接选择整个备份文件。
+
+### 选择备份内容
+
+| 选项 | 默认 | 作用 |
+| --- | --- | --- |
+| 包含评论 | 开启 | 保存评论；关闭后也不会抓取评论中的图片 |
+| 备份图片 | 开启 | 保存帖子以及所选评论的图片原始文件 |
+| 附带可直接阅读的文本 | 开启 | 生成 `readable.txt` |
+| 补全一层引用内容 | 关闭 | 保存正文或正文与评论中引用的帖子；可能加入范围之外的内容，增加任务耗时 |
+
+当前媒体备份支持树洞图片，不下载正文中任意外部链接，也不抓取音频或视频。
+
+单张图片上限为 **50 MiB**，图片文件合计上限为 **180 MiB**，整个备份上限为 **200 MiB**。图片超限或下载失败时会记录为缺失，其他已完成内容仍可保存；整个备份超限时需要缩小范围。图片较多时，建议按收藏分组或日期分次备份。
+
+### 暂停、继续和重试
+
+任务运行时可以点击 **“暂停”**，待安全暂停后再离开页面。重新打开 Toolkit 时，可以在原账号、原浏览器环境中点击 **“继续上次任务”**。断点保留七天；清理网站数据或切换浏览器会影响恢复。
+
+如果显示“部分完成”，可以先保存已有内容，再点击 **“重试未完成项”** 补抓。最近生成的完整或部分备份也可以通过 **“重新下载”** 获取；**“按相同设置再次备份”** 会开始一次新的抓取。
+
+## 从备份迁移关注
+
+1. 在旧账号中生成并保存备份。
+2. 登录接收关注的新账号，打开 Toolkit 的 **“迁移关注”**。
+3. 选择备份文件，点击 **“检查备份”**。支持 Toolkit ZIP 和旧版 JSON；多个文件会自动合并去重。
+4. 核对“将新增”“已关注并跳过”“仅作引用，不迁移”和“存在问题”等数量，再确认执行。
+
+检查阶段只读取数据；**确认后才会向当前账号新增关注**。迁移不会取消已有关注，不会重新发布正文或评论，也不重建原账号的收藏分组。补全引用的帖子只用于阅读上下文，不会自动关注。
+
+如果当前关注列表未能完整读取，工具会禁止执行迁移。结果不确定或有未完成项时，手动重试会先核对当前关注状态，避免重复写入；任务结束后会下载迁移审计文本。
+
+## 可选：连接 PkuHoleStudio
+
+已经使用 [PkuHoleStudio](https://github.com/Susurrium/PkuHoleStudio) 的用户，可以把备份发送到本机桌面端继续管理。
+
+1. 启动本机 Studio，在 Toolkit 的“备份到本机”中展开 **“可选：连接 PkuHoleStudio”**。
+2. 点击 **“连接 PkuHoleStudio”**，在 Studio 中核对并批准关联。
+3. 备份完成后点击 **“发送到 Studio”**，或选择备份完成后同时发送。
+4. 在 Studio 中查看预检结果，再确认导入。
+
+首次关联后无需每次复制接收码；旧版一次性接收码入口仍保留。未选择联动时 Toolkit 不会连接本机端口，Studio 不可用或发送失败也不会影响已经生成的本地备份。
+
+## 常见问题
+
+### 安装后没有“树洞备份”入口？
+
+确认脚本已启用、浏览器允许运行用户脚本，并且打开的是 `https://treehole.pku.edu.cn/web/`。登录后刷新页面，再等待约 10 秒检查右下角。仍然没有入口时，请反馈浏览器、脚本管理器和 Toolkit 版本。
+
+### 没有看到下载文件？
+
+先检查浏览器的下载列表及下载拦截提示。如果“最近备份”已经出现，可点击“重新下载”；不必重新抓取全部内容。
+
+### “部分完成”是否意味着整个备份不能用？
+
+已保存的内容仍可使用；提示表示某些帖子详情、评论或图片没有完成抓取或检查。查看任务提示及备份中的缺失记录，再重试未完成项。删除或无权访问的内容不能保证补回。
+
+### 为什么备份里的评论数与官网回复数不同？
+
+官网提供的回复数可能与评论接口返回数量不一致。Toolkit 实际读取评论，保留服务端回复数原值，并单独统计已保存的评论数量。开启评论时，显示为零回复的帖子也会检查评论接口。
+
+### 图片为什么缺失，或保存后无法打开？
+
+可能是图片已无法访问、下载失败、超过体积限制，或格式无法识别。关闭图片备份也不会保存图片文件。已保存图片保持原格式；部分格式需要使用支持它的查看器。具体缺失情况可查看任务提示和 `media/index.json`。
+
+### 登录过期、遇到限流，或换了账号怎么办？
+
+按提示暂停操作，重新登录原账号或等待后再继续。原账号的断点不能在另一个账号恢复；迁移关注时也必须在接收账号重新检查备份。不要通过多开任务或提高并发绕过限流。
+
+### 更新后会自动升级吗？
+
+当前脚本没有配置专用自动更新地址，请从[正式版发布页](https://github.com/Susurrium/PkuHoleToolkit/releases/latest)安装新版，并确认旧副本已禁用。更新前请先下载需要保留的备份。
+
+### 必须安装 Studio 吗？如何反馈问题？
+
+Toolkit 可以独立备份、阅读解压后的文本与图片、迁移关注。遇到问题请到 [GitHub Issues](https://github.com/Susurrium/PkuHoleToolkit/issues)提供版本、浏览器、操作步骤和错误提示；提交截图或日志前，请遮盖账号凭据和私人内容。
+
+## 数据与隐私
+
+- 备份只读取树洞数据。只有在迁移预检之后由你确认，工具才会新增关注。
+- 导出使用当前网页登录状态，请求树洞官网的正文、评论和图片接口；不会把内容上传到远程备份服务。主动选择 Studio 联动后，才会向本机 Studio 发送备份文件。
+- 任务断点和图片缓存在当前浏览器的网站存储中，保留七天。账号凭据不写入任务数据库或备份；本地账号指纹仅用于限制跨账号恢复，不进入 ZIP。Studio 只接收备份，不接收树洞账号、Cookie、token 或 UUID。
+- 下载文件包含帖子和评论等私人内容，请妥善保管。备份文件本身没有加密；断点的七天保留规则不会删除已经下载到电脑的文件。
+
+“完整备份”表示在所选选项和本次可访问数据范围内完成抓取与检查，不代表能恢复服务器已删除的内容；持续抓取期间也可能出现新评论。协议与 Studio 关联的实现说明见[开发文档](./docs/development.md)。
+
+## 开发与贡献
+
+Toolkit 使用 JavaScript 模块开发，构建为单个用户脚本，无第三方运行时或构建依赖。建议使用 **Node.js 24**。
+
+```sh
+git clone https://github.com/Susurrium/PkuHoleToolkit.git
+cd PkuHoleToolkit
 npm ci
 npm run check
 ```
 
-源码位于 `apps/userscript/src`，根目录 `.user.js` 是构建产物，不应手工修改。
+`npm run check` 执行语法与安全规则检查、格式检查、自动化测试、构建和生成脚本语法检查。单独构建使用 `npm run build`。
 
-`tests/fixtures/smoke.html` 可用于手工检查入口挂载和弹窗渲染；真实 API 流程仍应在 GreasyFork beta 与测试账号中验证。
+源码位于 [`apps/userscript/src`](./apps/userscript/src)，根目录 [`PKU-Hole export tool.user.js`](./PKU-Hole%20export%20tool.user.js) 是构建产物；请修改源码后重新生成，不要手工修改产物。
 
-## 发布
+### 从哪里读代码
 
-- GitHub 是源码和版本真源。
-- 正式发布前先使用独立 GreasyFork beta 脚本 ID，以小分组验证请求速率、暂停恢复和下载。
-- 正式 GreasyFork ID 建立后，才把其 `@downloadURL`/`@updateURL` 写入稳定构建；当前构建刻意不继承旧脚本的自动更新地址。
+| 模块 | 职责 |
+| --- | --- |
+| [`main.js`](./apps/userscript/src/main.js)、[`credentials.js`](./apps/userscript/src/credentials.js) | 启动、当前登录凭据与账号绑定 |
+| [`api.js`](./apps/userscript/src/api.js)、[`scheduler.js`](./apps/userscript/src/scheduler.js) | 官方接口、串行请求、限速、重试与取消 |
+| [`export-job.js`](./apps/userscript/src/export-job.js)、[`media.js`](./apps/userscript/src/media.js) | 范围、详情与评论抓取、引用补全、图片获取与校验 |
+| [`storage.js`](./apps/userscript/src/storage.js) | IndexedDB 断点和图片缓存 |
+| [`archive.js`](./apps/userscript/src/archive.js)、[`zip.js`](./apps/userscript/src/zip.js) | 归档、阅读文本与 ZIP 读写 |
+| [`import-job.js`](./apps/userscript/src/import-job.js) | 关注迁移预检、去重、写入与审计 |
+| [`studio-bridge.js`](./apps/userscript/src/studio-bridge.js)、[`ui.js`](./apps/userscript/src/ui.js) | 可选 Studio 联动与页面交互 |
 
-## 项目边界
+备份流程为：确定范围 → 逐帖读取详情与评论 → 保存图片和断点 → 生成 ZIP。评论和图片分别记录完成状态，补抓图片时复用已经核验的正文与评论。
 
-Toolkit 保持为轻量、可独立使用的用户脚本：后续只围绕官网 API/DOM 兼容、导出完整性、安全迁移和归档交付维护。PkuHoleStudio 联动是可选能力；桌面数据库、搜索、标签、笔记和 AI 不在本仓库开发。[`方案设计.md`](./方案设计.md) 是已归档的早期方案，不再作为开发路线图。
+### 协议、验证与贡献入口
+
+- [开发与发布说明](./docs/development.md)：本地验证、隔离浏览器夹具、请求策略、隐私和 Studio 协议。
+- [图片备份实现与验收记录](./docs/media-capture.md)：媒体接口、原始文件、缓存、体积边界和真实环境验证范围。
+- [归档协议](./packages/archive-schema/SPECIFICATION.md)：固定内置 PkuHole Archive Contract 2.1.0；运行时无需安装 Studio 或 Spec。媒体采用可选扩展，旧版 JSON 继续兼容。协议真源为 [PkuHoleArchiveSpec](https://github.com/Susurrium/PkuHoleArchiveSpec)。
+
+欢迎通过 Issue 描述问题，或提交包含必要验证的 Pull Request。Toolkit 的维护范围是官网兼容、备份完整性、关注迁移和归档交付；桌面数据库、搜索、标签、笔记和 AI 功能由其他项目负责。
+
+## 相关项目、更新记录与许可证
+
+- [PkuHoleStudio](https://github.com/Susurrium/PkuHoleStudio)：可选的桌面端联动。
+- [CHANGELOG](./CHANGELOG.md) 与 [GitHub Releases](https://github.com/Susurrium/PkuHoleToolkit/releases)：版本变化和可安装脚本。
+- [v1.3.0 Beta 验收记录](./BETA_TEST_CHECKLIST.md)与[早期方案](./方案设计.md)：历史资料，不作为当前安装指南或开发路线图。
+
+项目使用 [MIT License](./LICENSE)，原始作者 WindMan，后续由 Susurrium 等贡献者维护。感谢 Arthals 的油猴安装图文教程。

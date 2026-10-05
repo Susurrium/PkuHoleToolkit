@@ -1,4 +1,4 @@
-const ALLOWED_SCENARIOS = new Set(['default', 'paired', 'running', 'import-preview']);
+const ALLOWED_SCENARIOS = new Set(['default', 'paired', 'running', 'import-preview', 'media', 'media-partial']);
 const searchParameters = new URLSearchParams(location.search);
 const requestedScenario = searchParameters.get('scenario') || 'default';
 const scenario = ALLOWED_SCENARIOS.has(requestedScenario) ? requestedScenario : 'default';
@@ -6,8 +6,18 @@ const useGeneratedBundle = searchParameters.get('bundle') === '1';
 const fixtureUUID = 'fixture-account-uuid';
 const bridgeStateKey = 'pkuhole-studio-bridge-v2';
 const requests = [];
+const mediaFixtureState = { fail: scenario === 'media-partial' };
+const isMediaScenario = scenario.startsWith('media');
 
 const scenarios = {
+  media: {
+    description: '图片路径：模拟帖子多图、评论图片、GIF 和无媒体 ID 的旧图片帖。',
+    checks: ['生成备份应保存 5 个图片引用、2 个不同文件。', '刷新后可重新下载同一份含图备份。'],
+  },
+  'media-partial': {
+    description: '缺失路径：模拟一张图片返回 404，其余正文、评论和图片仍可备份。',
+    checks: ['结果必须显示部分完成和 1 张缺失图片。', '恢复模拟接口后，重试只应请求缺失图片。'],
+  },
   default: {
     description: '核心路径：面板默认只突出本地归档，Studio、任务状态和最近归档保持收起或隐藏。',
     checks: [
@@ -111,10 +121,13 @@ function installMocks() {
       return jsonResponse({
         code: 20000,
         data: {
-          data: [{ pid: 123456, text: 'fixture followed hole', reply: 0, is_follow: true }],
+          data: isMediaScenario ? [
+            { pid: 123456, text: 'fixture image post', reply: 1, media_ids: '9,10', is_follow: true },
+            { pid: 234567, text: '', type: 'image', reply: 0, is_follow: true },
+          ] : [{ pid: 123456, text: 'fixture followed hole', reply: 0, is_follow: true }],
           current_page: 1,
           last_page: 1,
-          total: 1,
+          total: isMediaScenario ? 2 : 1,
           next_page_url: null,
         },
       });
@@ -123,14 +136,30 @@ function installMocks() {
       const pid = Number(url.pathname.match(/\d+/)?.[0]);
       return jsonResponse({
         code: 20000,
-        data: { pid, text: 'fixture explicit hole', reply: 0, is_follow: pid === 123456 },
+        data: isMediaScenario
+          ? pid === 123456
+            ? { pid, text: 'fixture fresh image detail', reply: 1, media_ids: '9,10', is_follow: true }
+            : { pid, text: '', type: 'image', reply: 0, is_follow: true }
+          : { pid, text: 'fixture explicit hole', reply: 0, is_follow: pid === 123456 },
       });
     }
     if (/^\/api\/pku_comment_v3\/\d+$/.test(url.pathname)) {
+      const hasComments = isMediaScenario && url.pathname.endsWith('/123456');
       return jsonResponse({
         code: 20000,
-        data: { data: [], current_page: 1, last_page: 1, total: 0, next_page_url: null },
+        data: { data: hasComments ? [{ cid: 42, pid: 123456, text: 'fixture comment image', media_ids: '9,11' }] : [],
+          current_page: 1, last_page: 1, total: hasComments ? 1 : 0, next_page_url: null },
       });
+    }
+    if (url.pathname === '/chapi/api/v3/media/getImageBinary') {
+      if (mediaFixtureState.fail && url.searchParams.get('id') === '10') return jsonResponse({}, 404);
+      const id = url.searchParams.get('id');
+      const encoded = id === '10'
+        ? 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+        : 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6x8AAAAASUVORK5CYII=';
+      const bytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
+      return new Response(bytes, { headers: { 'Content-Type': id === '10' ? 'image/gif' : 'image/png',
+        'Content-Length': String(bytes.length) } });
     }
     return jsonResponse({ code: 40400, message: 'fixture route not found' }, 404);
   };
@@ -170,6 +199,7 @@ async function seedRunningJob() {
     }
   };
   const database = await requestResult(open);
+  const fingerprint = await accountFingerprint();
   const transaction = database.transaction('jobs', 'readwrite');
   transaction.objectStore('jobs').put({
     id: 'fixture-running-export',
@@ -177,7 +207,7 @@ async function seedRunningJob() {
     state: 'running',
     createdAt: Date.now() - 60_000,
     updatedAt: Date.now() - 30_000,
-    accountFingerprint: await accountFingerprint(),
+    accountFingerprint: fingerprint,
     options: {
       scope: { type: 'pids', pids: ['123456'] },
       includeComments: false,
@@ -283,8 +313,10 @@ async function loadToolkit() {
     throw new Error('请从仓库根目录启动本地 HTTP 服务后打开此夹具，file:// 无法提供测试凭据存储。');
   }
   installMocks();
-  await resetFixtureDatabase();
-  if (scenario === 'running') await seedRunningJob();
+  if (searchParameters.get('preserve') !== '1') {
+    await resetFixtureDatabase();
+    if (scenario === 'running') await seedRunningJob();
+  }
   const script = document.createElement('script');
   script.type = useGeneratedBundle ? 'text/javascript' : 'module';
   script.src = useGeneratedBundle
@@ -307,7 +339,7 @@ function showFixtureError(error) {
 }
 
 renderGuide();
-globalThis.__toolkitSmoke = { scenario, requests, toolkitShadow, useGeneratedBundle };
+globalThis.__toolkitSmoke = { scenario, requests, toolkitShadow, useGeneratedBundle, mediaFixtureState };
 try {
   await loadToolkit();
 } catch (error) {

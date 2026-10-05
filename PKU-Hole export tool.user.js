@@ -3,7 +3,7 @@
 // @name:zh-CN   北大树洞本地备份与关注迁移工具
 // @author       WindMan, Susurrium
 // @namespace    https://github.com/Susurrium/PkuHoleToolkit
-// @version      1.4.1
+// @version      1.5.0
 // @license      MIT
 // @description  独立完成北大树洞本地备份与关注迁移，可选联动 PkuHoleStudio
 // @match        https://treehole.pku.edu.cn/web/*
@@ -23,11 +23,11 @@
   'use strict';
 
 // ---- config.js ----
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.5.0';
 const API_ORIGIN = 'https://treehole.pku.edu.cn';
 const API_BASE = `${API_ORIGIN}/api`;
 const JOB_DB_NAME = 'pku-hole-tool';
-const JOB_DB_VERSION = 1;
+const JOB_DB_VERSION = 2;
 const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const PID_PATTERN = /^\d{5,7}$/;
@@ -51,6 +51,8 @@ const LIMITS = Object.freeze({
   maxImportPids: 20_000,
   maxArchiveBytes: 200 * 1024 * 1024,
   maxUncompressedBytes: 500 * 1024 * 1024,
+  maxMediaBytes: 50 * 1024 * 1024,
+  mediaBudgetBytes: 180 * 1024 * 1024,
 });
 
 const JOB_STATES = Object.freeze({
@@ -75,6 +77,7 @@ const ERROR_CODES = Object.freeze({
   BUSINESS_ERROR: 'business_error',
   UNKNOWN_RESULT: 'unknown_result',
   CANCELLED: 'cancelled',
+  PAUSED: 'paused',
   INVALID_INPUT: 'invalid_input',
   STORAGE_ERROR: 'storage_error',
 });
@@ -271,11 +274,19 @@ class RequestScheduler {
       context.signal?.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => controller.abort('timeout'), this.policy.timeoutMs);
       try {
-        const response = await this.fetchImpl(url, { ...options, signal: controller.signal });
+        const refreshed = await context.beforeAttempt?.();
+        throwIfAborted(context.signal, context.operation);
+        const response = await this.fetchImpl(url, { ...options, ...refreshed, signal: controller.signal });
         let body;
         try {
-          body = await response.json();
+          if (response.ok && context.readBody) body = await context.readBody(response);
+          else if (context.readBody) {
+            await response.body?.cancel?.();
+            body = null;
+          } else body = await response.json();
         } catch (error) {
+          if (error instanceof AppError) throw error;
+          if (controller.signal.aborted || context.readBody) throw error;
           if (!response.ok) body = null;
           else {
             throw new AppError(ERROR_CODES.INVALID_RESPONSE, '服务器返回了无法解析的数据', {
@@ -308,10 +319,20 @@ class RequestScheduler {
   }
 
   async requestJson(url, options = {}, context = {}) {
+    return this.request(url, options, context);
+  }
+
+  async requestBinary(url, options = {}, context = {}) {
+    return this.request(url, options, { ...context, kind: 'read' });
+  }
+
+  async request(url, options = {}, context = {}) {
     const normalized = {
       operation: context.operation || 'request',
       kind: context.kind === 'write' ? 'write' : 'read',
       signal: context.signal,
+      readBody: context.readBody,
+      beforeAttempt: context.beforeAttempt,
     };
     const maxAttempts =
       normalized.kind === 'write' ? 1 : Math.max(1, this.policy.maxReadAttempts);
@@ -377,6 +398,244 @@ class RequestScheduler {
     }
     throw lastError;
   }
+}
+
+
+// ---- media.js ----
+const MEDIA_EXTENSION = 'io.github.susurrium.pkuhole.media';
+
+function parseMediaIds(raw) {
+  if (raw === undefined || raw === null) return [];
+  const parts = String(raw).replace(/[\[\]"']/g, '').split(/[,;\s|]+/);
+  return [...new Set(parts.filter((id) => /^\d+$/.test(id)))];
+}
+
+function mediaTargets(hole, comments = []) {
+  const targets = [];
+  const add = (ownerType, ownerId, remoteId) => targets.push({
+    ownerType, ownerId: Number(ownerId), remoteId, variant: 'original',
+  });
+  if (hole) {
+    const ids = parseMediaIds(hole.media_ids);
+    for (const id of ids) add('post', hole.pid, id);
+    if (!ids.length && String(hole.type || '').trim().toLowerCase() === 'image') {
+      add('post', hole.pid, '');
+    }
+  }
+  for (const comment of comments) {
+    for (const id of parseMediaIds(comment.media_ids)) add('comment', comment.cid, id);
+  }
+  return targets;
+}
+
+function mediaTargetKey(target) {
+  return `${target.ownerType}:${target.ownerId}:${target.remoteId}`;
+}
+
+async function mediaSHA256(bytes) {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function invalidMedia(message, retryable = false) {
+  return new AppError(ERROR_CODES.INVALID_RESPONSE, message, { operation: 'download_media', retryable });
+}
+
+function detectImageType(bytes) {
+  const starts = (...signature) => signature.every((byte, index) => bytes[index] === byte);
+  const ascii = (start, end) => String.fromCharCode(...bytes.subarray(start, end));
+  if (starts(0xff, 0xd8, 0xff)) return { mimeType: 'image/jpeg', extension: '.jpg' };
+  if (starts(137, 80, 78, 71, 13, 10, 26, 10)) return { mimeType: 'image/png', extension: '.png' };
+  if (['GIF87a', 'GIF89a'].includes(ascii(0, 6))) return { mimeType: 'image/gif', extension: '.gif' };
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return { mimeType: 'image/webp', extension: '.webp' };
+  if (starts(66, 77)) return { mimeType: 'image/bmp', extension: '.bmp' };
+  if (starts(73, 73, 42, 0) || starts(77, 77, 0, 42)) return { mimeType: 'image/tiff', extension: '.tif' };
+  if (ascii(4, 8) === 'ftyp') {
+    const brands = [ascii(8, 12)];
+    const boxSize = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0);
+    for (let index = 16; index + 4 <= Math.min(boxSize, bytes.length, 256); index += 4) {
+      brands.push(ascii(index, index + 4));
+    }
+    if (brands.some((brand) => ['avif', 'avis'].includes(brand))) return { mimeType: 'image/avif', extension: '.avif' };
+    if (brands.some((brand) => ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand))) {
+      return { mimeType: 'image/heif', extension: '.heif' };
+    }
+  }
+  return null;
+}
+
+async function readMediaResponse(response, maxBytes = LIMITS.maxMediaBytes) {
+  const declaredType = (response.headers.get('Content-Type') || '').toLowerCase();
+  const declaredSize = Number(response.headers.get('Content-Length'));
+  if (/text\/html|application\/(?:json|[^;]+\+json)/.test(declaredType)) {
+    await response.body?.cancel?.();
+    throw invalidMedia('图片接口返回了错误页面或 JSON，未保存为图片');
+  }
+  if (declaredSize > maxBytes) {
+    await response.body?.cancel?.();
+    throw invalidMedia('图片超过本次备份的大小上限');
+  }
+  let bytes;
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > maxBytes) {
+          await reader.cancel();
+          throw invalidMedia('图片超过本次备份的大小上限');
+        }
+        chunks.push(value);
+      }
+      bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    } finally {
+      reader.releaseLock();
+    }
+  } else {
+    bytes = new Uint8Array(await response.arrayBuffer());
+  }
+  if (!bytes.length) throw invalidMedia('图片响应为空', true);
+  if (bytes.length > maxBytes) throw invalidMedia('图片超过本次备份的大小上限');
+  // Browsers transparently decompress responses, so compressed wire lengths
+  // cannot be compared to the decoded byte length.
+  if (!response.headers.get('Content-Encoding') && declaredSize > 0 && bytes.length !== declaredSize) {
+    throw invalidMedia('图片响应不完整，长度与服务器声明不一致', true);
+  }
+  const type = detectImageType(bytes);
+  if (!type) throw invalidMedia('图片内容格式无法确认，未保存为图片');
+  return { bytes, ...type };
+}
+
+async function verifyStoredMedia(record, bytes, verifiedHash = null) {
+  const type = bytes instanceof Uint8Array ? detectImageType(bytes) : null;
+  return Boolean(record?.status === 'available' && bytes instanceof Uint8Array && bytes.length > 0 &&
+    bytes.length === record.size && bytes.length <= LIMITS.maxMediaBytes &&
+    /^[a-f0-9]{64}$/.test(record.sha256 || '') && type && record.mimeType === type.mimeType &&
+    record.path === `media/${record.sha256}${type.extension}` &&
+    (verifiedHash || await mediaSHA256(bytes)) === record.sha256);
+}
+
+class MediaCapture {
+  constructor({ api, store, jobId, onProgress = () => {}, checkPause = () => {}, limits = LIMITS }) {
+    Object.assign(this, { api, store, jobId, onProgress, checkPause, limits });
+    this.records = new Map();
+    this.fileSizes = new Map();
+    this.verified = new Set();
+    this.attempted = new Set();
+  }
+
+  async initialize() {
+    for (const record of await this.store.getMedia(this.jobId)) {
+      this.records.set(mediaTargetKey(record), record);
+      if (record.status === 'available' && Number.isSafeInteger(record.size) && record.size > 0 &&
+        record.size <= this.limits.maxMediaBytes) this.fileSizes.set(record.sha256, record.size);
+    }
+  }
+
+  async capture(hole, comments, pid, signal) {
+    for (const target of mediaTargets(hole, comments)) {
+      throwIfAborted(signal, 'capture_media');
+      this.checkPause();
+      const key = mediaTargetKey(target);
+      if (this.attempted.has(key)) continue;
+      this.attempted.add(key);
+      const existing = this.records.get(key);
+      if (existing?.status === 'available') {
+        const bytes = await this.store.getMediaFile(this.jobId, existing.sha256);
+        if (await verifyStoredMedia(existing, bytes, this.verified.has(existing.sha256) ? existing.sha256 : null)) {
+          this.verified.add(existing.sha256);
+          continue;
+        }
+        this.fileSizes.delete(existing.sha256);
+      }
+      // The media ID identifies the same remote object across owners. Reuse
+      // verified bytes while retaining a separate ownership index entry.
+      const shared = target.remoteId && [...this.records.values()].find((record) =>
+        record.remoteId === target.remoteId && record.status === 'available' && this.verified.has(record.sha256));
+      if (shared) {
+        const record = { ...shared, ...target, pid: String(pid) };
+        await this.store.putMedia(this.jobId, record);
+        this.records.set(key, record);
+        continue;
+      }
+      const missing = { ...target, pid: String(pid), status: 'missing' };
+      await this.store.putMedia(this.jobId, missing);
+      this.records.set(key, missing);
+      let result;
+      try {
+        const used = [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0);
+        const remaining = this.limits.mediaBudgetBytes - used;
+        if (remaining <= 0) throw invalidMedia('图片总量已达到本次备份上限，请缩小备份范围');
+        result = await this.api.downloadMedia(target.remoteId, pid, signal,
+          Math.min(this.limits.maxMediaBytes, remaining));
+        throwIfAborted(signal, 'capture_media');
+        const type = detectImageType(result.bytes);
+        if (!type || !result.bytes.length || result.bytes.length > Math.min(this.limits.maxMediaBytes, remaining)) {
+          throw invalidMedia('图片内容无效或超过本次备份上限');
+        }
+        const sha256 = await mediaSHA256(result.bytes);
+        const available = { ...target, pid: String(pid), status: 'available', sha256,
+          size: result.bytes.length, mimeType: type.mimeType, path: `media/${sha256}${type.extension}` };
+        await this.store.putMedia(this.jobId, available, result.bytes);
+        this.records.set(key, available);
+        this.fileSizes.set(sha256, available.size);
+        this.verified.add(sha256);
+      } catch (error) {
+        if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED, ERROR_CODES.STORAGE_ERROR].includes(error.code)) {
+          throw error;
+        }
+        const record = { ...missing, error: toErrorRecord(error, { pid: String(pid), phase: 'media',
+          ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId }) };
+        await this.store.putMedia(this.jobId, record);
+        this.records.set(key, record);
+      }
+      this.onProgress({ type: 'media', pid: String(pid),
+        mediaAvailable: [...this.records.values()].filter((record) => record.status === 'available').length,
+        mediaMissing: [...this.records.values()].filter((record) => record.status === 'missing').length,
+        mediaBytes: [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0) });
+    }
+  }
+
+  complete(hole, comments) {
+    return mediaTargets(hole, comments).every((target) => this.records.get(mediaTargetKey(target))?.status === 'available');
+  }
+}
+
+async function prepareExportMedia(store, jobId, items) {
+  const saved = new Map((await store.getMedia(jobId)).map((record) => [mediaTargetKey(record), record]));
+  const index = [];
+  const files = {};
+  const errors = [];
+  for (const item of items) {
+    for (const target of mediaTargets(item.hole, item.comments)) {
+      const record = saved.get(mediaTargetKey(target));
+      let available = false;
+      if (record?.status === 'available') {
+        const cached = files[record.path];
+        const bytes = cached || await store.getMediaFile(jobId, record.sha256);
+        if (await verifyStoredMedia(record, bytes, cached ? record.sha256 : null)) {
+          files[record.path] = bytes;
+          available = true;
+        }
+      }
+      if (available) {
+        index.push({ ...target, status: 'available', path: record.path,
+          mimeType: record.mimeType, size: record.size, sha256: record.sha256 });
+      } else {
+        index.push({ ...target, status: 'missing' });
+        errors.push(record?.error || { code: ERROR_CODES.INVALID_RESPONSE,
+          message: '图片尚未保存或本地文件校验失败', pid: item.pid, phase: 'media',
+          ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId, retryable: true });
+      }
+    }
+  }
+  return { index, files, errors };
 }
 
 
@@ -460,6 +719,39 @@ class TreeholeApi {
     });
   }
 
+  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes) {
+    const pid = normalizePid(pidValue);
+    const id = String(remoteId ?? '').trim();
+    if (id && !/^\d+$/.test(id)) {
+      throw new AppError(ERROR_CODES.INVALID_INPUT, '媒体 ID 无效');
+    }
+    const url = new URL('/chapi/api/v3/media/getImageBinary', API_ORIGIN);
+    url.searchParams.set(id ? 'id' : 'pid', id || pid);
+    const beforeAttempt = async () => {
+      const credentials = await this.credentialsProvider();
+      if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，媒体任务已停止', {
+          operation: 'download_media',
+        });
+      }
+      return { headers: createAuthHeaders(credentials, { accept: 'image/*, application/octet-stream' }) };
+    };
+    const options = await beforeAttempt();
+    return this.scheduler.requestBinary(url.href, {
+      ...options,
+      method: 'GET',
+      credentials: 'include',
+      redirect: 'error',
+      referrer: `${API_ORIGIN}/web/`,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+    }, {
+      operation: 'download_media',
+      signal,
+      beforeAttempt,
+      readBody: (response) => readMediaResponse(response, maxBytes),
+    });
+  }
+
   async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
     const credentials = await this.credentialsProvider();
     if (
@@ -518,10 +810,16 @@ class TreeholeApi {
 
   async getHole(pidValue, signal) {
     const pid = normalizePid(pidValue);
-    return this.request(`/pku/${encodeURIComponent(pid)}/`, {
+    const hole = await this.request(`/pku/${encodeURIComponent(pid)}/`, {
       signal,
       operation: 'get_hole',
     });
+    if (!hole || Array.isArray(hole) || String(hole.pid) !== pid) {
+      throw new AppError(ERROR_CODES.INVALID_RESPONSE, `#${pid} 详情响应的帖子编号不一致`, {
+        operation: 'get_hole',
+      });
+    }
+    return hole;
   }
 
   async getAllFollowed({ bookmarkId = null, signal, onPage = () => {} } = {}) {
@@ -710,9 +1008,10 @@ function safeArchiveName(name) {
   return normalized;
 }
 
-function createZip(entries, date = new Date()) {
+function createZip(entries, date = new Date(), { maxBytes = Infinity } = {}) {
   const localParts = [];
   const centralParts = [];
+  let entryCount = 0;
   let localOffset = 0;
   const dos = dosDateTime(date);
 
@@ -734,8 +1033,7 @@ function createZip(entries, date = new Date()) {
       ...uint16(nameBytes.length),
       ...uint16(0),
     ]);
-    const localRecord = concatBytes([localHeader, nameBytes, data]);
-    localParts.push(localRecord);
+    localParts.push(localHeader, nameBytes, data);
 
     const centralHeader = new Uint8Array([
       ...uint32(ZIP_SIGNATURES.CENTRAL),
@@ -757,9 +1055,15 @@ function createZip(entries, date = new Date()) {
       ...uint32(localOffset),
     ]);
     centralParts.push(concatBytes([centralHeader, nameBytes]));
-    localOffset += localRecord.length;
+    localOffset += localHeader.length + nameBytes.length + data.length;
+    entryCount += 1;
+    if (entryCount > 65_535) throw new AppError(ERROR_CODES.INVALID_INPUT, '归档文件数量超过 ZIP 上限');
   }
 
+  const centralSize = centralParts.reduce((size, part) => size + part.length, 0);
+  if (localOffset + centralSize + 22 > maxBytes) {
+    throw new AppError(ERROR_CODES.INVALID_INPUT, '归档超过 200 MiB 上限，请缩小备份范围或取消图片备份；已保存的断点仍保留');
+  }
   const centralDirectory = concatBytes(centralParts);
   const end = new Uint8Array([
     ...uint32(ZIP_SIGNATURES.END),
@@ -989,8 +1293,16 @@ function validateArchiveV2(manifest, data) {
   return { manifest, data };
 }
 
-function buildReadableText(items) {
+function buildReadableText(items, mediaIndex = []) {
   const lines = [];
+  const mediaByOwner = new Map();
+  for (const entry of mediaIndex) {
+    const key = `${entry.ownerType}:${entry.ownerId}`;
+    if (!mediaByOwner.has(key)) mediaByOwner.set(key, []);
+    mediaByOwner.get(key).push(entry.status === 'available'
+      ? `图片文件: ${entry.path}` : `图片未保存: ${entry.remoteId || '原图'}`);
+  }
+  const mediaLines = (ownerType, ownerId) => mediaByOwner.get(`${ownerType}:${Number(ownerId)}`) || [];
   for (const item of items) {
     const hole = item.hole || {};
     const timestamp = Number(hole.timestamp);
@@ -1001,8 +1313,10 @@ function buildReadableText(items) {
       `Id:${item.pid}  Likenum:${hole.likenum ?? 0}  Reply:${hole.reply ?? 0}  Time:${formattedTime}`,
       `洞主: ${hole.text ?? ''}`,
     );
+    lines.push(...mediaLines('post', item.pid));
     for (const comment of item.comments || []) {
       lines.push(`${comment.name || '匿名'}: ${comment.text || ''}`);
+      lines.push(...mediaLines('comment', comment.cid));
     }
     lines.push('', '======================', '');
   }
@@ -1023,6 +1337,7 @@ function createManifest({
     ? {
         includeComments: scope.includeComments,
         includeReadable: scope.includeReadable,
+        ...(scope.includeMedia !== undefined ? { includeMedia: scope.includeMedia } : {}),
         referenceMode: scope.referenceMode,
       }
     : undefined;
@@ -1055,21 +1370,51 @@ function createManifest({
   };
 }
 
-function createArchive({ manifest, items, includeReadable = true }) {
-  const sanitizedItems = sanitizeForArchive(items);
+function createArchive({ manifest, items, includeReadable = true, media = null }) {
+  const missingOwners = new Set((media?.index || []).filter((entry) => entry.status === 'missing')
+    .map((entry) => `${entry.ownerType}:${entry.ownerId}`));
+  const sanitizedItems = sanitizeForArchive(items.map((item) => {
+    const { contentComplete, mediaComplete, detailComplete, ...portable } = item;
+    if (missingOwners.has(`post:${Number(item.pid)}`) ||
+      item.comments.some((comment) => missingOwners.has(`comment:${Number(comment.cid)}`))) {
+      portable.fetchStatus = 'partial';
+    }
+    return portable;
+  }));
+  if (media) {
+    const errors = [...manifest.errors.filter((error) => error.phase !== 'media'), ...media.errors];
+    manifest = { ...manifest,
+      complete: manifest.complete && media.errors.length === 0,
+      counts: { ...manifest.counts, media: media.index.length,
+        missingMedia: media.index.filter((entry) => entry.status === 'missing').length, failed: errors.length },
+      extensions: { ...manifest.extensions, [MEDIA_EXTENSION]: { version: 1, required: false } },
+      errors,
+    };
+  }
   const data = { items: sanitizedItems };
   validateArchiveV2(manifest, data);
   const entries = {
     'manifest.json': `${JSON.stringify(manifest, null, 2)}\n`,
     'data.json': `${JSON.stringify(data)}\n`,
   };
-  if (includeReadable) entries['readable.txt'] = buildReadableText(sanitizedItems);
-  const bytes = createZip(entries, new Date(manifest.exportedAt));
+  if (media) {
+    entries['media/index.json'] = `${JSON.stringify(media.index)}\n`;
+    Object.assign(entries, media.files);
+  }
+  if (includeReadable) entries['readable.txt'] = buildReadableText(sanitizedItems, media?.index);
+  const bytes = createZip(entries, new Date(manifest.exportedAt), { maxBytes: LIMITS.maxArchiveBytes });
   return {
+    manifest,
     bytes,
     blob: new Blob([bytes], { type: 'application/zip' }),
     filename: `pku-treehole-${manifest.runId}.treehole.zip`,
   };
+}
+
+async function createStoredExportArchive(store, job, items) {
+  const media = job.options?.includeMedia === true ? await prepareExportMedia(store, job.id, items) : null;
+  return createArchive({ manifest: job.manifest, items,
+    includeReadable: job.options?.includeReadable !== false, media });
 }
 
 function decodeJson(bytes, name) {
@@ -1502,14 +1847,13 @@ async function restoreLatestExportArchive(store, accountFingerprint = null) {
   if (!job) return null;
   const items = await store.getItems(job.id);
   if (!items.length) return null;
-  return {
-    job,
-    archive: createArchive({
-      manifest: job.manifest,
-      items,
-      includeReadable: job.options?.includeReadable !== false,
-    }),
-  };
+  const archive = await createStoredExportArchive(store, job, items);
+  const restoredJob = { ...job, manifest: archive.manifest };
+  if (job.manifest.complete && !archive.manifest.complete) {
+    Object.assign(restoredJob, { state: 'partial', errors: archive.manifest.errors });
+    await store.putJob(restoredJob);
+  }
+  return { job: restoredJob, archive };
 }
 
 function createStudioBridgeStorage({
@@ -1783,8 +2127,20 @@ class JobStore {
           const store = database.createObjectStore('items', { keyPath: 'key' });
           store.createIndex('jobId', 'jobId', { unique: false });
         }
+        for (const name of ['media', 'mediaFiles']) {
+          if (!database.objectStoreNames.contains(name)) {
+            const store = database.createObjectStore(name, { keyPath: 'key' });
+            store.createIndex('jobId', 'jobId', { unique: false });
+          }
+        }
       };
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        request.result.onversionchange = () => {
+          request.result.close();
+          this.databasePromise = null;
+        };
+        resolve(request.result);
+      };
       request.onerror = () => reject(request.error);
     });
     return this.databasePromise;
@@ -1815,15 +2171,19 @@ class JobStore {
   }
 
   async putItem(jobId, pid, item) {
-    const database = await this.open();
-    const transaction = database.transaction('items', 'readwrite');
-    transaction.objectStore('items').put({
-      key: `${jobId}:${pid}`,
-      jobId,
-      pid: String(pid),
-      item: cloneValue(item),
-    });
-    await transactionPromise(transaction);
+    try {
+      const database = await this.open();
+      const transaction = database.transaction('items', 'readwrite');
+      transaction.objectStore('items').put({
+        key: `${jobId}:${pid}`,
+        jobId,
+        pid: String(pid),
+        item: cloneValue(item),
+      });
+      await transactionPromise(transaction);
+    } catch (error) {
+      throw new AppError(ERROR_CODES.STORAGE_ERROR, '无法保存正文或评论进度，浏览器存储可能已满', { cause: error });
+    }
   }
 
   async getItems(jobId) {
@@ -1834,18 +2194,45 @@ class JobStore {
     return records.map((record) => record.item);
   }
 
+  async putMedia(jobId, record, bytes = null) {
+    try {
+      const database = await this.open();
+      const transaction = database.transaction(['media', 'mediaFiles'], 'readwrite');
+      transaction.objectStore('media').put({ key: `${jobId}:${mediaTargetKey(record)}`, jobId, record: cloneValue(record) });
+      if (bytes) transaction.objectStore('mediaFiles').put({ key: `${jobId}:${record.sha256}`, jobId, bytes });
+      await transactionPromise(transaction);
+    } catch (error) {
+      throw new AppError(ERROR_CODES.STORAGE_ERROR, '无法保存图片，浏览器存储可能已满；已保存的断点仍可恢复', { cause: error });
+    }
+  }
+
+  async getMedia(jobId) {
+    const database = await this.open();
+    const transaction = database.transaction('media', 'readonly');
+    const records = await requestPromise(transaction.objectStore('media').index('jobId').getAll(IDBKeyRange.only(jobId)));
+    return records.map((record) => record.record);
+  }
+
+  async getMediaFile(jobId, sha256) {
+    const database = await this.open();
+    const transaction = database.transaction('mediaFiles', 'readonly');
+    const record = await requestPromise(transaction.objectStore('mediaFiles').get(`${jobId}:${sha256}`));
+    return record?.bytes || null;
+  }
+
   async deleteJob(jobId) {
     const database = await this.open();
-    const transaction = database.transaction(['jobs', 'items'], 'readwrite');
+    const transaction = database.transaction(['jobs', 'items', 'media', 'mediaFiles'], 'readwrite');
     transaction.objectStore('jobs').delete(jobId);
-    const index = transaction.objectStore('items').index('jobId');
-    const request = index.openKeyCursor(IDBKeyRange.only(jobId));
-    request.onsuccess = () => {
-      const cursor = request.result;
-      if (!cursor) return;
-      transaction.objectStore('items').delete(cursor.primaryKey);
-      cursor.continue();
-    };
+    for (const name of ['items', 'media', 'mediaFiles']) {
+      const request = transaction.objectStore(name).index('jobId').openKeyCursor(IDBKeyRange.only(jobId));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        transaction.objectStore(name).delete(cursor.primaryKey);
+        cursor.continue();
+      };
+    }
     await transactionPromise(transaction);
   }
 
@@ -1863,6 +2250,8 @@ class MemoryJobStore {
     this.now = now;
     this.jobs = new Map();
     this.items = new Map();
+    this.media = new Map();
+    this.mediaFiles = new Map();
   }
 
   async putJob(job) {
@@ -1888,10 +2277,26 @@ class MemoryJobStore {
       .map(([, item]) => cloneValue(item));
   }
 
+  async putMedia(jobId, record, bytes = null) {
+    this.media.set(`${jobId}:${mediaTargetKey(record)}`, { jobId, record: cloneValue(record) });
+    if (bytes) this.mediaFiles.set(`${jobId}:${record.sha256}`, { jobId, bytes: bytes.slice() });
+  }
+
+  async getMedia(jobId) {
+    return [...this.media.values()].filter((value) => value.jobId === jobId).map((value) => cloneValue(value.record));
+  }
+
+  async getMediaFile(jobId, sha256) {
+    return this.mediaFiles.get(`${jobId}:${sha256}`)?.bytes.slice() || null;
+  }
+
   async deleteJob(jobId) {
     this.jobs.delete(jobId);
     for (const key of this.items.keys()) {
       if (key.startsWith(`${jobId}:`)) this.items.delete(key);
+    }
+    for (const records of [this.media, this.mediaFiles]) {
+      for (const [key, value] of records) if (value.jobId === jobId) records.delete(key);
     }
   }
 
@@ -1995,6 +2400,7 @@ function normalizeScope(scope) {
 }
 
 function normalizedOptions(options = {}) {
+  options = options || {};
   const scope = options.scope || { type: 'all' };
   if (!['all', 'group', 'pids', 'date'].includes(scope.type)) {
     throw new AppError(ERROR_CODES.INVALID_INPUT, '未知导出范围');
@@ -2003,6 +2409,7 @@ function normalizedOptions(options = {}) {
     scope: normalizeScope(scope),
     includeComments: options.includeComments !== false,
     includeReadable: options.includeReadable !== false,
+    includeMedia: options.includeMedia !== false,
     referenceMode: ['none', 'body', 'all'].includes(options.referenceMode)
       ? options.referenceMode
       : 'none',
@@ -2028,6 +2435,7 @@ class ExportJob {
     now = () => new Date(),
     onProgress = () => {},
     confirmReferences = async (count) => count <= LIMITS.confirmReferencedPids,
+    limits = LIMITS,
   }) {
     this.api = api;
     this.store = store;
@@ -2035,6 +2443,7 @@ class ExportJob {
     this.now = now;
     this.onProgress = onProgress;
     this.confirmReferences = confirmReferences;
+    this.limits = limits;
     this.pauseRequested = false;
     this.controller = null;
     this.jobId = null;
@@ -2065,7 +2474,8 @@ class ExportJob {
       for (const pid of options.scope.pids) {
         throwIfAborted(signal, 'plan_explicit_pids');
         try {
-          holes.push(await this.api.getHole(pid, signal));
+          const saved = this.existingItems.get(pid);
+          holes.push(saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal));
         } catch (error) {
           if (
             isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
@@ -2105,50 +2515,80 @@ class ExportJob {
 
   async processHole({ job, hole, source, options, signal, references }) {
     const pid = normalizePid(hole.pid);
-    let comments = [];
-    let fetchStatus = 'ok';
-    let error = null;
-    if (options.includeComments && Number(hole.reply || 0) > 0) {
+    const previous = this.existingItems.get(pid);
+    let detailComplete = previous?.detailComplete === true || source !== 'followed';
+    const reuseContent = previous?.contentComplete === true && previous?.detailComplete === true;
+    if (previous?.detailComplete === true) hole = previous.hole;
+    let comments = previous?.comments || [];
+    let contentComplete = detailComplete && (reuseContent || !options.includeComments);
+    const errors = [];
+    const snapshot = () => sanitizeForArchive({ pid, source, hole, comments,
+      fetchStatus: 'partial', contentComplete, detailComplete });
+    // Keep list text as a fallback, but only verified detail can complete an
+    // item. Old checkpoints lack this evidence and must be checked once.
+    let item = snapshot();
+    await this.store.putItem(job.id, pid, item);
+    if (!detailComplete) {
+      try {
+        hole = await this.api.getHole(pid, signal);
+        detailComplete = true;
+        contentComplete = !options.includeComments;
+      } catch (error) {
+        if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED,
+          ERROR_CODES.STORAGE_ERROR].includes(error.code)) throw error;
+        errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
+      }
+      await this.store.putItem(job.id, pid, snapshot());
+    }
+    this.checkPause(signal);
+    if (options.includeMedia) await this.mediaCapture.capture(hole, [], pid, signal);
+    this.checkPause(signal);
+    if (!reuseContent && options.includeComments) {
       try {
         const result = await this.api.getAllComments(pid, {
           signal,
           onPage: (progress) => this.emit({ type: 'comments', pid, ...progress }),
         });
         comments = result.items;
-        if (!result.complete) {
-          fetchStatus = 'partial';
-          error = {
+        const expectedComments = Number(hole.reply);
+        const belowDetailCount = detailComplete && Number.isSafeInteger(expectedComments) &&
+          expectedComments > comments.length;
+        contentComplete = detailComplete && result.complete && !belowDetailCount;
+        if (!result.complete || belowDetailCount) {
+          errors.push({
             code: ERROR_CODES.INVALID_RESPONSE,
             message:
-              result.reason === 'comment_count_mismatch'
+              belowDetailCount
+                ? `#${pid} 实际保存 ${comments.length} 条评论，少于详情记录的 ${expectedComments} 条`
+                : result.reason === 'comment_count_mismatch'
                 ? `#${pid} 评论实际数量与服务端总数不一致`
                 : `#${pid} 评论达到安全页数上限`,
             pid,
             phase: 'comments',
             retryable: true,
-          };
+          });
         }
       } catch (caught) {
         if (
           isAppError(caught, ERROR_CODES.UNAUTHORIZED) ||
           isAppError(caught, ERROR_CODES.RATE_LIMITED) ||
-          isAppError(caught, ERROR_CODES.CANCELLED)
+          isAppError(caught, ERROR_CODES.CANCELLED) ||
+          isAppError(caught, ERROR_CODES.STORAGE_ERROR)
         ) {
           throw caught;
         }
-        fetchStatus = 'partial';
-        error = toErrorRecord(caught, { pid, phase: 'comments' });
+        contentComplete = false;
+        errors.push(toErrorRecord(caught, { pid, phase: 'comments' }));
       }
     }
 
-    const item = sanitizeForArchive({
-      pid,
-      source,
-      hole,
-      comments,
-      fetchStatus,
-    });
+    item = snapshot();
     await this.store.putItem(job.id, pid, item);
+    if (options.includeMedia) await this.mediaCapture.capture(null, comments, pid, signal);
+    item.mediaComplete = !options.includeMedia || this.mediaCapture.complete(hole, comments);
+    item.fetchStatus = contentComplete && item.mediaComplete ? 'ok' : 'partial';
+    await this.store.putItem(job.id, pid, item);
+    this.existingItems.set(pid, item);
 
     if (options.referenceMode !== 'none') {
       referencesFromText(hole.text).forEach((reference) => references.add(reference));
@@ -2158,7 +2598,12 @@ class ExportJob {
         );
       }
     }
-    return error;
+    return errors;
+  }
+
+  checkPause(signal) {
+    throwIfAborted(signal, 'export');
+    if (this.pauseRequested) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停');
   }
 
   async run(rawOptions = null, { jobId = null, signal: externalSignal } = {}) {
@@ -2170,7 +2615,8 @@ class ExportJob {
     if (job && job.type !== 'export') {
       throw new AppError(ERROR_CODES.INVALID_INPUT, '任务类型不是导出任务');
     }
-    const options = normalizedOptions(job ? job.options : rawOptions);
+    // Old checkpoints describe text-only exports. Preserve their scope.
+    const options = normalizedOptions(job ? { ...job.options, includeMedia: job.options?.includeMedia === true } : rawOptions);
     if (job && job.accountFingerprint !== this.accountFingerprint) {
       throw new AppError(ERROR_CODES.UNAUTHORIZED, '该断点属于另一个账号，不能恢复');
     }
@@ -2197,15 +2643,23 @@ class ExportJob {
     const onExternalAbort = () => this.controller.abort(externalSignal.reason);
     externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
     const signal = this.controller.signal;
+    if (externalSignal?.aborted) this.controller.abort(externalSignal.reason);
     this.api.scheduler?.resetRateLimitCount?.();
 
     try {
       await this.saveState(job, JOB_STATES.PLANNING);
+      const existingItems = await this.store.getItems(job.id);
+      this.existingItems = new Map(existingItems.map((item) => [item.pid, item]));
       const plan = await this.planHoles(options, signal);
       const basePids = new Set(plan.holes.map((hole) => String(hole.pid)));
-      const existingItems = await this.store.getItems(job.id);
+      if (options.includeMedia) {
+        this.mediaCapture = new MediaCapture({ api: this.api, store: this.store, jobId: job.id,
+          limits: this.limits, onProgress: (event) => this.emit(event), checkPause: () => this.checkPause(signal) });
+        await this.mediaCapture.initialize();
+      }
       const completedPids = new Set(
-        existingItems.filter((item) => item.fetchStatus === 'ok').map((item) => item.pid),
+        existingItems.filter((item) => item.fetchStatus === 'ok' && item.detailComplete === true)
+          .map((item) => item.pid),
       );
       const errors = [...plan.errors];
       job.total = plan.holes.length;
@@ -2218,6 +2672,7 @@ class ExportJob {
       const references = new Set();
       if (options.referenceMode !== 'none') {
         for (const item of existingItems) {
+          if (item.detailComplete !== true) continue;
           referencesFromText(item.hole?.text).forEach((reference) => references.add(reference));
           if (options.referenceMode === 'all') {
             item.comments?.forEach((comment) =>
@@ -2233,8 +2688,8 @@ class ExportJob {
           return { job, paused: true };
         }
         const pid = normalizePid(hole.pid);
-        if (!completedPids.has(pid)) {
-          const error = await this.processHole({
+        if (!completedPids.has(pid) || options.includeMedia) {
+          const itemErrors = await this.processHole({
             job,
             hole,
             source: options.scope.type === 'pids' ? 'explicit' : 'followed',
@@ -2242,7 +2697,7 @@ class ExportJob {
             signal,
             references,
           });
-          if (error) errors.push(error);
+          errors.push(...itemErrors);
           completedPids.add(pid);
           job.completed = completedPids.size;
           await this.store.putJob({ ...job, completed: job.completed, errors });
@@ -2276,10 +2731,11 @@ class ExportJob {
           await this.saveState(job, JOB_STATES.PAUSED, { errors });
           return { job, paused: true };
         }
-        if (completedPids.has(pid)) continue;
+        if (completedPids.has(pid) && !options.includeMedia) continue;
         try {
-          const hole = await this.api.getHole(pid, signal);
-          const error = await this.processHole({
+          const hole = this.existingItems.get(pid)?.detailComplete
+            ? this.existingItems.get(pid).hole : await this.api.getHole(pid, signal);
+          const itemErrors = await this.processHole({
             job,
             hole,
             source: 'referenced',
@@ -2287,13 +2743,15 @@ class ExportJob {
             signal,
             references: new Set(),
           });
-          if (error) errors.push(error);
+          errors.push(...itemErrors);
           completedPids.add(pid);
         } catch (error) {
           if (
             isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
             isAppError(error, ERROR_CODES.RATE_LIMITED) ||
-            isAppError(error, ERROR_CODES.CANCELLED)
+            isAppError(error, ERROR_CODES.CANCELLED) ||
+            isAppError(error, ERROR_CODES.PAUSED) ||
+            isAppError(error, ERROR_CODES.STORAGE_ERROR)
           ) {
             throw error;
           }
@@ -2305,8 +2763,10 @@ class ExportJob {
       }
 
       const items = await this.store.getItems(job.id);
+      const media = options.includeMedia ? await prepareExportMedia(this.store, job.id, items) : null;
+      if (media) errors.push(...media.errors);
       const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');
-      const manifest = createManifest({
+      let manifest = createManifest({
         runId: job.id,
         scope: options,
         complete,
@@ -2319,17 +2779,23 @@ class ExportJob {
         manifest,
         items,
         includeReadable: options.includeReadable,
+        media,
       });
-      await this.saveState(job, complete ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL, {
+      manifest = archive.manifest;
+      await this.saveState(job, manifest.complete ? JOB_STATES.COMPLETED : JOB_STATES.PARTIAL, {
         completed: items.length,
-        errors,
+        errors: manifest.errors,
         manifest,
       });
       return { job, manifest, archive, paused: false };
     } catch (error) {
+      if (isAppError(error, ERROR_CODES.PAUSED)) {
+        await this.saveState(job, JOB_STATES.PAUSED);
+        return { job, paused: true };
+      }
       let state = JOB_STATES.FAILED;
       if (isAppError(error, ERROR_CODES.CANCELLED)) state = JOB_STATES.CANCELLED;
-      else if (isAppError(error, ERROR_CODES.RATE_LIMITED)) state = JOB_STATES.PAUSED;
+      else if ([ERROR_CODES.RATE_LIMITED, ERROR_CODES.STORAGE_ERROR, ERROR_CODES.UNAUTHORIZED].includes(error.code)) state = JOB_STATES.PAUSED;
       await this.saveState(job, state, {
         errors: [...(job.errors || []), toErrorRecord(error, { phase: 'job' })],
       });
@@ -2802,6 +3268,7 @@ function exportSummaryText(options = {}) {
   };
   const parts = [scopeLabels[options.scope?.type] || '全部关注'];
   parts.push(options.includeComments === false ? '不含评论' : '包含评论');
+  parts.push(options.includeMedia === false ? '不含图片' : '包含图片');
   if (options.referenceMode === 'body') parts.push('补全正文引用');
   else if (options.referenceMode === 'all') parts.push('补全正文和评论引用');
   else parts.push('不补全引用');
@@ -2959,14 +3426,15 @@ function panelTemplate() {
             <details class="disclosure" data-export-options>
               <summary>更多备份选项</summary>
               <div class="disclosure-body">
-                <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-readable" type="checkbox" checked>附带可直接阅读的文本</label></div>
+                <div class="checks"><label><input id="include-comments" type="checkbox" checked>包含评论</label><label><input id="include-media" type="checkbox" checked>备份图片（含所选评论中的图片）</label><label><input id="include-readable" type="checkbox" checked>附带可直接阅读的文本</label></div>
+                <p class="hint">图片保留原始文件。单张最多 50 MiB，图片合计最多 180 MiB；超限或下载失败会列为缺失，仍可保存已完成的内容。较大的备份请按分组或日期分次进行。</p>
                 <div class="field"><label for="reference-mode">补全一层引用内容</label><select id="reference-mode"><option value="none">不补全引用</option><option value="body">补全正文中的引用</option><option value="all">补全正文和评论中的引用</option></select></div>
                 <p class="hint">补全引用可能加入所选范围之外的帖子，并增加请求数量。</p>
               </div>
             </details>
             <input id="delivery-download" type="checkbox" checked hidden aria-hidden="true">
             <div class="actions primary-actions"><button class="primary" type="button" data-action="export">生成并下载备份</button></div>
-            <p class="hint">每次都会生成一份新的完整快照；生成后仍可重新下载。</p>
+            <p class="hint">每次都会生成一份新的备份；未完成内容会明确标注，生成后仍可重新下载。</p>
 
             <div class="result-card" data-recent-export hidden>
               <h3>最近备份</h3>
@@ -3219,9 +3687,10 @@ function mountToolkit({
       return;
     }
     const counts = manifest?.counts;
-    $('[data-recent-export-summary]').textContent = note || (counts
-      ? `${manifest.complete ? '备份完成' : '部分备份'}：${counts.exportedHoles} 个帖子、${counts.comments} 条评论。`
-      : '最近生成的备份可以直接重新下载，不需要再次抓取。');
+    const summary = counts
+      ? `${manifest.complete ? '备份完成' : '部分备份'}：${counts.exportedHoles} 个帖子、${counts.comments} 条评论${counts.media !== undefined ? `、${counts.media - counts.missingMedia} 张图片已保存、${counts.missingMedia} 张缺失` : ''}。`
+      : '最近生成的备份可以直接重新下载，不需要再次抓取。';
+    $('[data-recent-export-summary]').textContent = note ? `${note} ${summary}` : summary;
     $('[data-recent-export-filename]').textContent = lastArchive.filename || '';
     studioSendButton.hidden = studioBridgeState?.status !== 'paired';
     renderControls();
@@ -3357,6 +3826,10 @@ function mountToolkit({
   }
 
   function handleProgress(event) {
+    if (event.type === 'media') {
+      setMessage(`正在保存 #${event.pid} 的图片：${event.mediaAvailable} 张已保存、${event.mediaMissing} 张未保存，共 ${(event.mediaBytes / (1024 * 1024)).toFixed(1)} MiB`);
+      return;
+    }
     const total = Number(event.total || 0);
     const completed = Number(event.completed || event.count || 0);
     progress.max = Math.max(1, total);
@@ -3411,10 +3884,8 @@ function mountToolkit({
       try {
         const { credentials } = await credentialsForCurrentAccount();
         if (activeJob || isRunning) return null;
-        const [restored, jobs] = await Promise.all([
-          restoreLatestExportArchive(store, credentials.accountFingerprint),
-          store.listJobs(),
-        ]);
+        const restored = await restoreLatestExportArchive(store, credentials.accountFingerprint);
+        const jobs = await store.listJobs();
         if (activeJob || isRunning) return null;
         if (restored) {
           lastArchive = restored.archive;
@@ -3465,6 +3936,7 @@ function mountToolkit({
       scope,
       includeComments: $('#include-comments').checked,
       includeReadable: $('#include-readable').checked,
+      includeMedia: $('#include-media').checked,
       referenceMode: $('#reference-mode').value,
     };
   }
@@ -3530,6 +4002,7 @@ function mountToolkit({
           windowObject.confirm(`检测到 ${count} 个引用洞，是否继续抓取？`),
       });
       const result = await activeJob.run(options, { jobId });
+      lastExportOptions = result.job.options;
       activeJobId = result.job.id;
       if (result.paused) {
         setTaskStatus('paused');
@@ -3546,7 +4019,7 @@ function mountToolkit({
           ? '备份完成，浏览器下载已经开始。'
           : '备份已经生成，但浏览器没有启动下载；可以点击“重新下载”。'
         : `已生成部分备份，${result.manifest.errors.length} 项未完成；可以先下载，也可以重试。`;
-      renderRecentExport(result.manifest, archiveMessage);
+      renderRecentExport(result.manifest);
       setMessage(archiveMessage, !result.manifest.complete || delivery.download === 'failed');
       if (delivery.studio === 'awaiting_confirmation') {
         setStudioMessage(
@@ -3561,7 +4034,7 @@ function mountToolkit({
       const cancelled = error.code === ERROR_CODES.CANCELLED;
       setMessage(cancelled ? '备份已取消。' : error.message || '备份失败', !cancelled);
       setTaskStatus(
-        cancelled ? 'cancelled' : error.code === ERROR_CODES.RATE_LIMITED ? 'paused' : 'failed',
+        cancelled ? 'cancelled' : [ERROR_CODES.RATE_LIMITED, ERROR_CODES.STORAGE_ERROR, ERROR_CODES.UNAUTHORIZED].includes(error.code) ? 'paused' : 'failed',
       );
     } finally {
       activeJob = null;
@@ -3881,7 +4354,7 @@ function mountToolkit({
     if (event.target.value === 'group') ensureBookmarks();
     updateExportSummary();
   });
-  for (const selector of ['#include-comments', '#include-readable', '#reference-mode']) {
+  for (const selector of ['#include-comments', '#include-media', '#include-readable', '#reference-mode']) {
     $(selector).addEventListener('change', updateExportSummary);
   }
   for (const selector of ['#bookmark', '#start-date', '#end-date']) {

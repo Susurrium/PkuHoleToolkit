@@ -1,8 +1,8 @@
-export const APP_VERSION = '1.4.1';
+export const APP_VERSION = '1.5.0';
 export const API_ORIGIN = 'https://treehole.pku.edu.cn';
 export const API_BASE = `${API_ORIGIN}/api`;
 export const JOB_DB_NAME = 'pku-hole-tool';
-export const JOB_DB_VERSION = 1;
+export const JOB_DB_VERSION = 2;
 export const JOB_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const PID_PATTERN = /^\d{5,7}$/;
@@ -26,6 +26,8 @@ export const LIMITS = Object.freeze({
   maxImportPids: 20_000,
   maxArchiveBytes: 200 * 1024 * 1024,
   maxUncompressedBytes: 500 * 1024 * 1024,
+  maxMediaBytes: 50 * 1024 * 1024,
+  mediaBudgetBytes: 180 * 1024 * 1024,
 });
 
 export const JOB_STATES = Object.freeze({

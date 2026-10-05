@@ -1,6 +1,7 @@
 import { APP_VERSION, LIMITS, PID_PATTERN } from './config.js';
 import { AppError, ERROR_CODES } from './errors.js';
 import { createZip, readZip } from './zip.js';
+import { MEDIA_EXTENSION, prepareExportMedia } from './media.js';
 
 const SENSITIVE_KEY_PATTERN = /token|authorization|cookie|uuid|accountFingerprint/i;
 export const ARCHIVE_SPEC_VERSION = '2.1.0';
@@ -155,8 +156,16 @@ export function validateArchiveV2(manifest, data) {
   return { manifest, data };
 }
 
-export function buildReadableText(items) {
+export function buildReadableText(items, mediaIndex = []) {
   const lines = [];
+  const mediaByOwner = new Map();
+  for (const entry of mediaIndex) {
+    const key = `${entry.ownerType}:${entry.ownerId}`;
+    if (!mediaByOwner.has(key)) mediaByOwner.set(key, []);
+    mediaByOwner.get(key).push(entry.status === 'available'
+      ? `图片文件: ${entry.path}` : `图片未保存: ${entry.remoteId || '原图'}`);
+  }
+  const mediaLines = (ownerType, ownerId) => mediaByOwner.get(`${ownerType}:${Number(ownerId)}`) || [];
   for (const item of items) {
     const hole = item.hole || {};
     const timestamp = Number(hole.timestamp);
@@ -167,8 +176,10 @@ export function buildReadableText(items) {
       `Id:${item.pid}  Likenum:${hole.likenum ?? 0}  Reply:${hole.reply ?? 0}  Time:${formattedTime}`,
       `洞主: ${hole.text ?? ''}`,
     );
+    lines.push(...mediaLines('post', item.pid));
     for (const comment of item.comments || []) {
       lines.push(`${comment.name || '匿名'}: ${comment.text || ''}`);
+      lines.push(...mediaLines('comment', comment.cid));
     }
     lines.push('', '======================', '');
   }
@@ -189,6 +200,7 @@ export function createManifest({
     ? {
         includeComments: scope.includeComments,
         includeReadable: scope.includeReadable,
+        ...(scope.includeMedia !== undefined ? { includeMedia: scope.includeMedia } : {}),
         referenceMode: scope.referenceMode,
       }
     : undefined;
@@ -221,21 +233,51 @@ export function createManifest({
   };
 }
 
-export function createArchive({ manifest, items, includeReadable = true }) {
-  const sanitizedItems = sanitizeForArchive(items);
+export function createArchive({ manifest, items, includeReadable = true, media = null }) {
+  const missingOwners = new Set((media?.index || []).filter((entry) => entry.status === 'missing')
+    .map((entry) => `${entry.ownerType}:${entry.ownerId}`));
+  const sanitizedItems = sanitizeForArchive(items.map((item) => {
+    const { contentComplete, mediaComplete, detailComplete, ...portable } = item;
+    if (missingOwners.has(`post:${Number(item.pid)}`) ||
+      item.comments.some((comment) => missingOwners.has(`comment:${Number(comment.cid)}`))) {
+      portable.fetchStatus = 'partial';
+    }
+    return portable;
+  }));
+  if (media) {
+    const errors = [...manifest.errors.filter((error) => error.phase !== 'media'), ...media.errors];
+    manifest = { ...manifest,
+      complete: manifest.complete && media.errors.length === 0,
+      counts: { ...manifest.counts, media: media.index.length,
+        missingMedia: media.index.filter((entry) => entry.status === 'missing').length, failed: errors.length },
+      extensions: { ...manifest.extensions, [MEDIA_EXTENSION]: { version: 1, required: false } },
+      errors,
+    };
+  }
   const data = { items: sanitizedItems };
   validateArchiveV2(manifest, data);
   const entries = {
     'manifest.json': `${JSON.stringify(manifest, null, 2)}\n`,
     'data.json': `${JSON.stringify(data)}\n`,
   };
-  if (includeReadable) entries['readable.txt'] = buildReadableText(sanitizedItems);
-  const bytes = createZip(entries, new Date(manifest.exportedAt));
+  if (media) {
+    entries['media/index.json'] = `${JSON.stringify(media.index)}\n`;
+    Object.assign(entries, media.files);
+  }
+  if (includeReadable) entries['readable.txt'] = buildReadableText(sanitizedItems, media?.index);
+  const bytes = createZip(entries, new Date(manifest.exportedAt), { maxBytes: LIMITS.maxArchiveBytes });
   return {
+    manifest,
     bytes,
     blob: new Blob([bytes], { type: 'application/zip' }),
     filename: `pku-treehole-${manifest.runId}.treehole.zip`,
   };
+}
+
+export async function createStoredExportArchive(store, job, items) {
+  const media = job.options?.includeMedia === true ? await prepareExportMedia(store, job.id, items) : null;
+  return createArchive({ manifest: job.manifest, items,
+    includeReadable: job.options?.includeReadable !== false, media });
 }
 
 function decodeJson(bytes, name) {
