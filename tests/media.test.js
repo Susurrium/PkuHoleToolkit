@@ -88,7 +88,7 @@ test('media retries share rate handling and recheck credentials at request time'
   let rateCalls = 0;
   const limited = makeApi(async () => { rateCalls += 1; return json({}, 429); });
   await assert.rejects(limited.downloadMedia('9', '123456'), { code: ERROR_CODES.RATE_LIMITED });
-  assert.equal(rateCalls, 2);
+  assert.equal(rateCalls, 3);
 });
 
 test('media rejects HTML, disguised JSON, empty, oversized and truncated payloads', async () => {

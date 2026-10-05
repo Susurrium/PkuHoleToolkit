@@ -743,12 +743,30 @@ export function mountToolkit({
     countLabel.textContent = `${completed} / ${total || '?'}`;
     if (event.state) setTaskStatus(event.state);
     else if (!['planning', 'previewing'].includes(taskState)) setTaskStatus('running');
-    if (event.pid) setMessage(`正在处理帖子 #${event.pid}`);
+    if (api.scheduler?.recovering) {
+      const seconds = Math.max(0, Math.ceil((api.scheduler.blockedUntil - Date.now()) / 1000));
+      setMessage(seconds ? `服务器要求等待约 ${seconds} 秒，之后会自动尝试继续。` : '正在检查服务器是否恢复，随后继续备份。');
+    } else if (event.type === 'comments') {
+      setMessage(`正在处理帖子 #${event.pid} 的评论：${event.commentCount} / ${event.commentTotal ?? '?'}；其他帖子同时进行。`);
+    } else if (event.pid) setMessage(`正在处理帖子 #${event.pid}`);
     else if (event.phase === 'archive_files') {
       setMessage(`正在读取备份文件：${completed} / ${total || '?'}…`);
     } else if (event.phase === 'remote_followed') {
       setMessage(`正在读取当前关注列表：${completed} / ${total || '?'}…`);
     }
+  }
+
+  if (api.scheduler) {
+    const previousRateLimit = api.scheduler.onRateLimit;
+    const previousRecovered = api.scheduler.onRateLimitRecovered;
+    api.scheduler.onRateLimit = (event) => {
+      previousRateLimit?.(event);
+      if (isRunning) setMessage(`服务器要求等待约 ${Math.ceil(event.retryAfter / 1000)} 秒，之后会自动尝试继续。`);
+    };
+    api.scheduler.onRateLimitRecovered = () => {
+      previousRecovered?.();
+      if (isRunning) setMessage('服务器已恢复，正在继续任务…');
+    };
   }
 
   async function ensureBookmarks() {
@@ -887,7 +905,7 @@ export function mountToolkit({
     activeKind = 'export';
     setTaskStatus('planning');
     setRunning(true);
-    setMessage('正在读取所选范围，随后会逐个保存帖子和评论…');
+    setMessage('正在读取所选范围，随后会并行保存帖子和评论…');
     try {
       const { credentials, accountChanged } = await credentialsForCurrentAccount();
       if (accountChanged && jobId) {

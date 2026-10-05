@@ -38,7 +38,7 @@ function unwrapPayload(payload, operation) {
   return payload.data ?? payload;
 }
 
-function normalizePaginator(value, operation, fallbackPage = 1) {
+function normalizePaginator(value, operation, fallbackPage = 1, requestedSize = null) {
   if (Array.isArray(value)) {
     return { items: value, nextPage: null, lastPage: 1, total: value.length };
   }
@@ -49,25 +49,32 @@ function normalizePaginator(value, operation, fallbackPage = 1) {
     });
   }
   const currentPage = Number(value.current_page || fallbackPage);
-  const parsedLastPage = Number(value.last_page);
-  const lastPage = Number.isFinite(parsedLastPage)
+  if (!Number.isInteger(currentPage) || currentPage !== fallbackPage) {
+    throw new AppError(ERROR_CODES.INVALID_RESPONSE, 'API 返回了错误的分页页码', { operation });
+  }
+  const parsedLastPage = value.last_page == null ? NaN : Number(value.last_page);
+  const lastPage = Number.isInteger(parsedLastPage) && parsedLastPage >= currentPage
     ? parsedLastPage
     : value.next_page_url
       ? Number.POSITIVE_INFINITY
       : currentPage;
   return {
     items: value.data,
-    nextPage: value.next_page_url ? currentPage + 1 : null,
+    nextPage: value.next_page_url || currentPage < lastPage ? currentPage + 1 : null,
     lastPage,
-    total: Number.isFinite(Number(value.total)) ? Number(value.total) : null,
+    total: value.total != null && Number.isInteger(Number(value.total)) && Number(value.total) >= 0
+      ? Number(value.total) : null,
+    pageSize: Number.isInteger(Number(value.per_page)) && Number(value.per_page) > 0
+      ? Math.min(requestedSize, Number(value.per_page)) : requestedSize,
   };
 }
 
 export class TreeholeApi {
-  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null }) {
+  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null, pageSizes = null }) {
     this.scheduler = scheduler;
     this.credentialsProvider = credentialsProvider;
     this.expectedAccountFingerprint = expectedAccountFingerprint;
+    this.pageSizes = pageSizes || { followed: LIMITS.followedPageSize, comments: LIMITS.commentPageSize };
   }
 
   forAccount(accountFingerprint) {
@@ -79,10 +86,11 @@ export class TreeholeApi {
       scheduler: this.scheduler,
       credentialsProvider: this.credentialsProvider,
       expectedAccountFingerprint,
+      pageSizes: this.pageSizes,
     });
   }
 
-  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes) {
+  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes, { shouldPause } = {}) {
     const pid = normalizePid(pidValue);
     const id = String(remoteId ?? '').trim();
     if (id && !/^\d+$/.test(id)) {
@@ -91,6 +99,7 @@ export class TreeholeApi {
     const url = new URL('/chapi/api/v3/media/getImageBinary', API_ORIGIN);
     url.searchParams.set(id ? 'id' : 'pid', id || pid);
     const beforeAttempt = async () => {
+      if (shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: 'download_media' });
       const credentials = await this.credentialsProvider();
       if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
         throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，媒体任务已停止', {
@@ -110,21 +119,22 @@ export class TreeholeApi {
     }, {
       operation: 'download_media',
       signal,
+      shouldPause,
       beforeAttempt,
       readBody: (response) => readMediaResponse(response, maxBytes),
     });
   }
 
-  async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
-    const credentials = await this.credentialsProvider();
-    if (
-      this.expectedAccountFingerprint &&
-      credentials.accountFingerprint !== this.expectedAccountFingerprint
-    ) {
-      throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', {
-        operation,
-      });
-    }
+  async request(path, { params, method = 'GET', kind = 'read', signal, operation, shouldPause }) {
+    const currentCredentials = async () => {
+      if (shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation });
+      const credentials = await this.credentialsProvider();
+      if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', { operation });
+      }
+      return credentials;
+    };
+    const credentials = await currentCredentials();
     const body = await this.scheduler.requestJson(
       apiUrl(path, params),
       {
@@ -134,7 +144,7 @@ export class TreeholeApi {
         referrer: 'https://treehole.pku.edu.cn/web/',
         referrerPolicy: 'strict-origin-when-cross-origin',
       },
-      { operation, kind, signal },
+      { operation, kind, signal, shouldPause, beforeSend: async () => ({ headers: createAuthHeaders(await currentCredentials()) }) },
     );
     return unwrapPayload(body, operation);
   }
@@ -152,29 +162,49 @@ export class TreeholeApi {
     }));
   }
 
-  async listFollowedPage({ page, limit = 25, bookmarkId, signal }) {
-    const value = await this.request('/follow_v2', {
+  async readPage(path, options, category, legacySize) {
+    let size = options.params.limit;
+    let value;
+    try {
+      value = await this.request(path, options);
+    } catch (error) {
+      const rejectsLimit = /limit|per.page|分页|每页|条数/i.test(`${error.message} ${JSON.stringify(error.details)}`);
+      const canFallBack = [400, 422].includes(error.status) ||
+        (error.status == null && error.code === ERROR_CODES.BUSINESS_ERROR);
+      if (size <= legacySize || !rejectsLimit || !canFallBack) throw error;
+      size = legacySize;
+      this.pageSizes[category] = size;
+      value = await this.request(path, { ...options, params: { ...options.params, limit: size } });
+    }
+    const result = normalizePaginator(value, options.operation, options.params.page, size);
+    if (result.pageSize) this.pageSizes[category] = result.pageSize;
+    return { ...result, pageSize: result.pageSize || size };
+  }
+
+  async listFollowedPage({ page, limit = this.pageSizes.followed, bookmarkId, signal, shouldPause }) {
+    return this.readPage('/follow_v2', {
       params: { page, limit, bookmark_id: bookmarkId },
       signal,
+      shouldPause,
       operation: 'list_followed',
-    });
-    return normalizePaginator(value, 'list_followed', page);
+    }, 'followed', 25);
   }
 
-  async listCommentsPage(pidValue, { page, limit = 15, signal }) {
+  async listCommentsPage(pidValue, { page, limit = this.pageSizes.comments, signal, shouldPause }) {
     const pid = normalizePid(pidValue);
-    const value = await this.request(`/pku_comment_v3/${encodeURIComponent(pid)}`, {
+    return this.readPage(`/pku_comment_v3/${encodeURIComponent(pid)}`, {
       params: { page, limit, sort: 'asc' },
       signal,
+      shouldPause,
       operation: 'list_comments',
-    });
-    return normalizePaginator(value, 'list_comments', page);
+    }, 'comments', 15);
   }
 
-  async getHole(pidValue, signal) {
+  async getHole(pidValue, signal, { shouldPause } = {}) {
     const pid = normalizePid(pidValue);
     const hole = await this.request(`/pku/${encodeURIComponent(pid)}/`, {
       signal,
+      shouldPause,
       operation: 'get_hole',
     });
     if (!hole || Array.isArray(hole) || String(hole.pid) !== pid) {
@@ -185,13 +215,27 @@ export class TreeholeApi {
     return hole;
   }
 
-  async getAllFollowed({ bookmarkId = null, signal, onPage = () => {} } = {}) {
+  async getAllFollowed({ bookmarkId = null, signal, onPage = () => {}, shouldPause = () => false } = {}) {
     const seen = new Map();
     let page = 1;
     let expectedTotal = null;
+    let pageSize = this.pageSizes.followed;
+    let reason = 'followed_page_limit';
     while (page <= LIMITS.followedPages) {
-      const result = await this.listFollowedPage({ page, bookmarkId, signal });
+      if (shouldPause()) { reason = 'paused'; break; }
+      let result;
+      try {
+        result = await this.listFollowedPage({ page, bookmarkId, signal, shouldPause });
+      } catch (error) {
+        if (!isAppError(error, ERROR_CODES.PAUSED)) throw error;
+        reason = 'paused'; break;
+      }
+      if (page > 1 && result.pageSize !== pageSize) {
+        seen.clear(); page = 1; pageSize = result.pageSize; continue;
+      }
+      pageSize = result.pageSize;
       expectedTotal = result.total ?? expectedTotal;
+      const previousCount = seen.size;
       for (const hole of result.items) {
         if (hole?.pid) seen.set(String(hole.pid), hole);
       }
@@ -205,25 +249,40 @@ export class TreeholeApi {
           reason: complete ? null : 'followed_count_mismatch',
         };
       }
+      if (seen.size === previousCount) { reason = 'followed_no_progress'; break; }
       page = result.nextPage;
     }
     return {
       items: [...seen.values()],
       expectedTotal,
       complete: false,
-      reason: 'followed_page_limit',
+      reason,
     };
   }
 
-  async getAllComments(pidValue, { signal, onPage = () => {} } = {}) {
+  async getAllComments(pidValue, { signal, onPage = () => {}, shouldPause = () => false } = {}) {
     const pid = normalizePid(pidValue);
     const seen = new Map();
     const unkeyed = [];
     let page = 1;
     let expectedTotal = null;
+    let pageSize = this.pageSizes.comments;
+    let reason = 'comment_page_limit';
     while (page <= LIMITS.commentPages) {
-      const result = await this.listCommentsPage(pid, { page, signal });
+      if (shouldPause()) { reason = 'paused'; break; }
+      let result;
+      try {
+        result = await this.listCommentsPage(pid, { page, signal, shouldPause });
+      } catch (error) {
+        if (!isAppError(error, ERROR_CODES.PAUSED)) throw error;
+        reason = 'paused'; break;
+      }
+      if (page > 1 && result.pageSize !== pageSize) {
+        seen.clear(); unkeyed.length = 0; page = 1; pageSize = result.pageSize; continue;
+      }
+      pageSize = result.pageSize;
       expectedTotal = result.total ?? expectedTotal;
+      const previousCount = seen.size + unkeyed.length;
       for (const comment of result.items) {
         const key = comment?.cid ?? comment?.id;
         if (key === undefined || key === null) unkeyed.push(comment);
@@ -240,13 +299,14 @@ export class TreeholeApi {
           reason: complete ? null : 'comment_count_mismatch',
         };
       }
+      if (seen.size + unkeyed.length === previousCount) { reason = 'comment_no_progress'; break; }
       page = result.nextPage;
     }
     return {
       items: [...seen.values(), ...unkeyed],
       expectedTotal,
       complete: false,
-      reason: 'comment_page_limit',
+      reason,
     };
   }
 

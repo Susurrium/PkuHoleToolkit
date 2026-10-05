@@ -121,12 +121,15 @@ export async function verifyStoredMedia(record, bytes, verifiedHash = null) {
 }
 
 export class MediaCapture {
-  constructor({ api, store, jobId, onProgress = () => {}, checkPause = () => {}, limits = LIMITS }) {
-    Object.assign(this, { api, store, jobId, onProgress, checkPause, limits });
+  constructor({ api, store, jobId, onProgress = () => {}, checkPause = () => {}, shouldPause = () => false, limits = LIMITS }) {
+    Object.assign(this, { api, store, jobId, onProgress, checkPause, shouldPause, limits });
     this.records = new Map();
     this.fileSizes = new Map();
     this.verified = new Set();
     this.attempted = new Set();
+    this.downloads = new Map();
+    this.reservedBytes = 0;
+    this.capacityChanged = new Promise((resolve) => { this.wakeCapacity = resolve; });
   }
 
   async initialize() {
@@ -137,6 +140,87 @@ export class MediaCapture {
     }
   }
 
+  releaseCapacity(bytes) {
+    this.reservedBytes -= bytes;
+    this.wakeCapacity();
+    this.capacityChanged = new Promise((resolve) => { this.wakeCapacity = resolve; });
+  }
+
+  async reserveCapacity(signal) {
+    while (true) {
+      throwIfAborted(signal, 'capture_media');
+      this.checkPause();
+      const used = [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0);
+      const remaining = this.limits.mediaBudgetBytes - used - this.reservedBytes;
+      const bytes = Math.min(this.limits.maxMediaBytes, this.limits.mediaBudgetBytes - used);
+      if (bytes > 0 && remaining >= bytes) {
+        this.reservedBytes += bytes;
+        return bytes;
+      }
+      if (!this.reservedBytes) throw invalidMedia('图片总量已达到本次备份上限，请缩小备份范围');
+      const changed = this.capacityChanged;
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        changed.then(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        });
+      });
+    }
+  }
+
+  async captureTarget(target, pid, signal) {
+    const key = mediaTargetKey(target);
+    const existing = this.records.get(key);
+    if (existing?.status === 'available') {
+      const bytes = await this.store.getMediaFile(this.jobId, existing.sha256);
+      if (await verifyStoredMedia(existing, bytes, this.verified.has(existing.sha256) ? existing.sha256 : null)) {
+        this.verified.add(existing.sha256);
+        return existing;
+      }
+      this.fileSizes.delete(existing.sha256);
+    }
+    const shared = target.remoteId && [...this.records.values()].find((record) =>
+      record.remoteId === target.remoteId && record.status === 'available' && this.verified.has(record.sha256));
+    if (shared) return shared;
+    const missing = { ...target, pid: String(pid), status: 'missing' };
+    await this.store.putMedia(this.jobId, missing);
+    this.records.set(key, missing);
+    let reserved = 0;
+    try {
+      reserved = await this.reserveCapacity(signal);
+      const result = await this.api.downloadMedia(target.remoteId, pid, signal, reserved, { shouldPause: this.shouldPause });
+      throwIfAborted(signal, 'capture_media');
+      const type = detectImageType(result.bytes);
+      if (!type || !result.bytes.length || result.bytes.length > reserved) {
+        throw invalidMedia('图片内容无效或超过本次备份上限');
+      }
+      const sha256 = await mediaSHA256(result.bytes);
+      throwIfAborted(signal, 'capture_media');
+      const available = { ...target, pid: String(pid), status: 'available', sha256,
+        size: result.bytes.length, mimeType: type.mimeType, path: `media/${sha256}${type.extension}` };
+      await this.store.putMedia(this.jobId, available, result.bytes);
+      this.records.set(key, available);
+      this.fileSizes.set(sha256, available.size);
+      this.verified.add(sha256);
+      return available;
+    } catch (error) {
+      if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED,
+        ERROR_CODES.STORAGE_ERROR, ERROR_CODES.PAUSED].includes(error.code)) throw error;
+      const record = { ...missing, error: toErrorRecord(error, { pid: String(pid), phase: 'media',
+        ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId }) };
+      await this.store.putMedia(this.jobId, record);
+      this.records.set(key, record);
+      return record;
+    } finally {
+      if (reserved) this.releaseCapacity(reserved);
+    }
+  }
+
   async capture(hole, comments, pid, signal) {
     for (const target of mediaTargets(hole, comments)) {
       throwIfAborted(signal, 'capture_media');
@@ -144,59 +228,19 @@ export class MediaCapture {
       const key = mediaTargetKey(target);
       if (this.attempted.has(key)) continue;
       this.attempted.add(key);
-      const existing = this.records.get(key);
-      if (existing?.status === 'available') {
-        const bytes = await this.store.getMediaFile(this.jobId, existing.sha256);
-        if (await verifyStoredMedia(existing, bytes, this.verified.has(existing.sha256) ? existing.sha256 : null)) {
-          this.verified.add(existing.sha256);
-          continue;
-        }
-        this.fileSizes.delete(existing.sha256);
-      }
-      // The media ID identifies the same remote object across owners. Reuse
-      // verified bytes while retaining a separate ownership index entry.
-      const shared = target.remoteId && [...this.records.values()].find((record) =>
-        record.remoteId === target.remoteId && record.status === 'available' && this.verified.has(record.sha256));
-      if (shared) {
-        const record = { ...shared, ...target, pid: String(pid) };
-        await this.store.putMedia(this.jobId, record);
-        this.records.set(key, record);
-        continue;
-      }
-      const missing = { ...target, pid: String(pid), status: 'missing' };
-      await this.store.putMedia(this.jobId, missing);
-      this.records.set(key, missing);
-      let result;
-      try {
-        const used = [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0);
-        const remaining = this.limits.mediaBudgetBytes - used;
-        if (remaining <= 0) throw invalidMedia('图片总量已达到本次备份上限，请缩小备份范围');
-        result = await this.api.downloadMedia(target.remoteId, pid, signal,
-          Math.min(this.limits.maxMediaBytes, remaining));
-        throwIfAborted(signal, 'capture_media');
-        const type = detectImageType(result.bytes);
-        if (!type || !result.bytes.length || result.bytes.length > Math.min(this.limits.maxMediaBytes, remaining)) {
-          throw invalidMedia('图片内容无效或超过本次备份上限');
-        }
-        const sha256 = await mediaSHA256(result.bytes);
-        const available = { ...target, pid: String(pid), status: 'available', sha256,
-          size: result.bytes.length, mimeType: type.mimeType, path: `media/${sha256}${type.extension}` };
-        await this.store.putMedia(this.jobId, available, result.bytes);
-        this.records.set(key, available);
-        this.fileSizes.set(sha256, available.size);
-        this.verified.add(sha256);
-      } catch (error) {
-        if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED, ERROR_CODES.STORAGE_ERROR].includes(error.code)) {
-          throw error;
-        }
-        const record = { ...missing, error: toErrorRecord(error, { pid: String(pid), phase: 'media',
-          ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId }) };
-        await this.store.putMedia(this.jobId, record);
-        this.records.set(key, record);
-      }
+      // Share in-flight downloads across post/comment owners, including failures.
+      const remoteKey = target.remoteId ? `id:${target.remoteId}` : `pid:${pid}`;
+      if (!this.downloads.has(remoteKey)) this.downloads.set(remoteKey, this.captureTarget(target, pid, signal));
+      const captured = await this.downloads.get(remoteKey);
+      throwIfAborted(signal, 'capture_media');
+      const record = { ...captured, ...target, pid: String(pid) };
+      if (captured.error) record.error = { ...captured.error, pid: String(pid),
+        ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId };
+      if (mediaTargetKey(captured) !== key) await this.store.putMedia(this.jobId, record);
+      this.records.set(key, record);
       this.onProgress({ type: 'media', pid: String(pid),
-        mediaAvailable: [...this.records.values()].filter((record) => record.status === 'available').length,
-        mediaMissing: [...this.records.values()].filter((record) => record.status === 'missing').length,
+        mediaAvailable: [...this.records.values()].filter((value) => value.status === 'available').length,
+        mediaMissing: [...this.records.values()].filter((value) => value.status === 'missing').length,
         mediaBytes: [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0) });
     }
   }

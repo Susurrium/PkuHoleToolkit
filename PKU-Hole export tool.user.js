@@ -35,15 +35,20 @@ const REFERENCE_PATTERN = /#(\d{5,7})\b/g;
 const LEADING_REFERENCE_PATTERN = /^(\d{5,7})(?=\s)/;
 
 const REQUEST_POLICY = Object.freeze({
-  readIntervalMs: 600,
+  readIntervalMs: 200,
   writeIntervalMs: 1000,
-  jitterMs: 300,
-  timeoutMs: 20_000,
+  readJitterMs: 100,
+  writeJitterMs: 300,
+  maxReadConcurrent: 6,
+  timeoutMs: 30_000,
   maxReadAttempts: 3,
   missingRetryAfterMs: 60_000,
 });
 
 const LIMITS = Object.freeze({
+  exportWorkers: 6,
+  followedPageSize: 200,
+  commentPageSize: 200,
   followedPages: 1024,
   commentPages: 500,
   maxReferencedPids: 2000,
@@ -225,6 +230,7 @@ class RequestScheduler {
     random = Math.random,
     policy = REQUEST_POLICY,
     onRateLimit = () => {},
+    onRateLimitRecovered = () => {},
   } = {}) {
     if (!fetchImpl) throw new TypeError('fetchImpl is required');
     this.fetchImpl = fetchImpl;
@@ -232,39 +238,150 @@ class RequestScheduler {
     this.now = now;
     this.random = random;
     this.policy = { ...REQUEST_POLICY, ...policy };
+    if (policy.jitterMs !== undefined) {
+      this.policy.readJitterMs = policy.jitterMs;
+      this.policy.writeJitterMs = policy.jitterMs;
+    }
     this.onRateLimit = onRateLimit;
-    this.queue = Promise.resolve();
-    this.lastStartedAt = 0;
+    this.onRateLimitRecovered = onRateLimitRecovered;
+    this.queue = [];
+    this.draining = false;
+    this.inFlight = 0;
+    this.writeInFlight = false;
+    this.lastStartedAt = null;
     this.rateLimitCount = 0;
+    this.blockedUntil = 0;
+    this.blockVersion = 0;
+    this.recovering = false;
+    this.probeLease = null;
+    this.changed = new Promise((resolve) => { this.wake = resolve; });
   }
 
   resetRateLimitCount() {
     this.rateLimitCount = 0;
   }
 
-  async enqueue(kind, signal, callback) {
-    const previous = this.queue;
-    let release;
-    this.queue = new Promise((resolve) => {
-      release = resolve;
-    });
-    await previous;
+  pausePending() {
+    for (const entry of [...this.queue]) {
+      if (!entry.shouldPause?.()) continue;
+      entry.remove();
+      entry.reject(new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: entry.operation }));
+    }
+    this.notify();
+  }
+
+  notify() {
+    this.wake();
+    this.changed = new Promise((resolve) => { this.wake = resolve; });
+  }
+
+  block(retryAfter, status) {
+    this.blockedUntil = Math.max(this.blockedUntil, this.now() + retryAfter);
+    this.blockVersion += 1;
+    this.recovering = true;
+    this.rateLimitCount += 1;
+    this.notify();
+    this.onRateLimit({ retryAfter, blockedUntil: this.blockedUntil, count: this.rateLimitCount, status });
+  }
+
+  recovered(lease) {
+    if (!this.recovering) return;
+    // An older in-flight success cannot clear a newer server cooldown.
+    if (this.probeLease !== lease || lease.blockVersion !== this.blockVersion) return;
+    this.recovering = false;
+    this.blockedUntil = 0;
+    this.rateLimitCount = 0;
+    this.notify();
+    this.onRateLimitRecovered();
+  }
+
+  async drain() {
+    if (this.draining) return;
+    this.draining = true;
     try {
-      throwIfAborted(signal);
-      const interval =
-        kind === 'write' ? this.policy.writeIntervalMs : this.policy.readIntervalMs;
-      const jitter = Math.floor(this.random() * (this.policy.jitterMs + 1));
-      const remaining = this.lastStartedAt + interval + jitter - this.now();
-      if (remaining > 0) await this.sleepImpl(remaining, signal);
-      this.lastStartedAt = this.now();
-      return await callback();
+      while (this.queue.length) {
+        const changed = this.changed;
+        const entry = this.recovering
+          ? this.queue.find((candidate) => candidate.kind === 'read')
+          : this.queue[0];
+        if (
+          !entry || this.inFlight >= this.policy.maxReadConcurrent ||
+          (entry.kind === 'write' && this.writeInFlight) ||
+          (this.recovering && this.probeLease)
+        ) {
+          await changed;
+          continue;
+        }
+        try {
+          throwIfAborted(entry.signal);
+          const interval = entry.kind === 'write' ? this.policy.writeIntervalMs : this.policy.readIntervalMs;
+          const jitterRange = entry.kind === 'write' ? this.policy.writeJitterMs : this.policy.readJitterMs;
+          const jitter = Math.floor(this.random() * (jitterRange + 1));
+          const startsAfter = this.lastStartedAt === null ? this.now() : this.lastStartedAt + interval + jitter;
+          let remaining = Math.max(startsAfter, this.blockedUntil) - this.now();
+          while (remaining > 0) {
+            await this.sleepImpl(remaining, entry.waitController.signal);
+            throwIfAborted(entry.signal);
+            remaining = Math.max(startsAfter, this.blockedUntil) - this.now();
+          }
+          if (this.recovering && (this.probeLease || entry.kind !== 'read')) continue;
+          const overrides = await entry.beforeSend?.();
+          throwIfAborted(entry.signal);
+          if (!this.queue.includes(entry)) continue;
+          if (this.now() < this.blockedUntil || (this.recovering && (this.probeLease || entry.kind !== 'read'))) continue;
+          const lease = { kind: entry.kind, blockVersion: this.blockVersion, overrides };
+          if (this.recovering) this.probeLease = lease;
+          this.inFlight += 1;
+          if (entry.kind === 'write') this.writeInFlight = true;
+          this.lastStartedAt = this.now();
+          entry.remove();
+          entry.resolve(lease);
+          // Let the admitted request start before timing the next admission.
+          await Promise.resolve();
+        } catch (error) {
+          entry.remove();
+          entry.reject(error);
+        }
+      }
     } finally {
-      release();
+      this.draining = false;
+    }
+  }
+
+  async enqueue(context, callback) {
+    throwIfAborted(context.signal);
+    if (context.shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: context.operation });
+    const lease = await new Promise((resolve, reject) => {
+      const entry = { ...context, resolve, reject, waitController: new AbortController() };
+      const onAbort = () => {
+        entry.remove();
+        reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消', { operation: context.operation }));
+        this.notify();
+      };
+      entry.remove = () => {
+        const index = this.queue.indexOf(entry);
+        if (index !== -1) this.queue.splice(index, 1);
+        entry.waitController.abort('dequeued');
+        entry.signal?.removeEventListener('abort', onAbort);
+      };
+      entry.signal?.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(entry);
+      this.notify();
+      void this.drain();
+    });
+    try {
+      throwIfAborted(context.signal);
+      return await callback(lease);
+    } finally {
+      this.inFlight -= 1;
+      if (lease.kind === 'write') this.writeInFlight = false;
+      if (this.probeLease === lease) this.probeLease = null;
+      this.notify();
     }
   }
 
   async fetchAttempt(url, options, context) {
-    return this.enqueue(context.kind, context.signal, async () => {
+    return this.enqueue(context, async (lease) => {
       const controller = new AbortController();
       let externallyAborted = false;
       const onAbort = () => {
@@ -274,9 +391,17 @@ class RequestScheduler {
       context.signal?.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => controller.abort('timeout'), this.policy.timeoutMs);
       try {
-        const refreshed = await context.beforeAttempt?.();
+        const response = await this.fetchImpl(url, { ...options, ...lease.overrides, signal: controller.signal });
+        if (response.status === 429) {
+          this.block(
+            retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now) ?? this.policy.missingRetryAfterMs,
+            429,
+          );
+        } else if (response.status === 503) {
+          const retryAfter = retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now);
+          if (retryAfter !== null) this.block(retryAfter, 503);
+        }
         throwIfAborted(context.signal, context.operation);
-        const response = await this.fetchImpl(url, { ...options, ...refreshed, signal: controller.signal });
         let body;
         try {
           if (response.ok && context.readBody) body = await context.readBody(response);
@@ -296,6 +421,10 @@ class RequestScheduler {
               operation: context.operation,
             });
           }
+        }
+        if (response.ok && body?.success !== false && (body?.code === undefined || body.code === 20000)) {
+          throwIfAborted(context.signal, context.operation);
+          this.recovered(lease);
         }
         return { response, body };
       } catch (error) {
@@ -332,7 +461,8 @@ class RequestScheduler {
       kind: context.kind === 'write' ? 'write' : 'read',
       signal: context.signal,
       readBody: context.readBody,
-      beforeAttempt: context.beforeAttempt,
+      beforeSend: context.beforeSend || context.beforeAttempt,
+      shouldPause: context.shouldPause,
     };
     const maxAttempts =
       normalized.kind === 'write' ? 1 : Math.max(1, this.policy.maxReadAttempts);
@@ -358,12 +488,10 @@ class RequestScheduler {
           });
         }
         if (status === 429) {
-          this.rateLimitCount += 1;
           const retryAfter =
             retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now) ??
             this.policy.missingRetryAfterMs;
-          this.onRateLimit({ retryAfter, count: this.rateLimitCount });
-          if (this.rateLimitCount >= 2 || normalized.kind === 'write') {
+          if (attempt === maxAttempts || normalized.kind === 'write') {
             throw new AppError(ERROR_CODES.RATE_LIMITED, '请求过于频繁，任务已暂停', {
               status,
               retryable: true,
@@ -371,10 +499,8 @@ class RequestScheduler {
               details: { retryAfter },
             });
           }
-          if (attempt < maxAttempts) {
-            await this.sleepImpl(retryAfter, normalized.signal);
-            continue;
-          }
+          // Re-enter the shared gate; one read probes before the queue resumes.
+          continue;
         }
 
         throw new AppError(ERROR_CODES.BUSINESS_ERROR, `HTTP ${status}`, {
@@ -522,12 +648,15 @@ async function verifyStoredMedia(record, bytes, verifiedHash = null) {
 }
 
 class MediaCapture {
-  constructor({ api, store, jobId, onProgress = () => {}, checkPause = () => {}, limits = LIMITS }) {
-    Object.assign(this, { api, store, jobId, onProgress, checkPause, limits });
+  constructor({ api, store, jobId, onProgress = () => {}, checkPause = () => {}, shouldPause = () => false, limits = LIMITS }) {
+    Object.assign(this, { api, store, jobId, onProgress, checkPause, shouldPause, limits });
     this.records = new Map();
     this.fileSizes = new Map();
     this.verified = new Set();
     this.attempted = new Set();
+    this.downloads = new Map();
+    this.reservedBytes = 0;
+    this.capacityChanged = new Promise((resolve) => { this.wakeCapacity = resolve; });
   }
 
   async initialize() {
@@ -538,6 +667,87 @@ class MediaCapture {
     }
   }
 
+  releaseCapacity(bytes) {
+    this.reservedBytes -= bytes;
+    this.wakeCapacity();
+    this.capacityChanged = new Promise((resolve) => { this.wakeCapacity = resolve; });
+  }
+
+  async reserveCapacity(signal) {
+    while (true) {
+      throwIfAborted(signal, 'capture_media');
+      this.checkPause();
+      const used = [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0);
+      const remaining = this.limits.mediaBudgetBytes - used - this.reservedBytes;
+      const bytes = Math.min(this.limits.maxMediaBytes, this.limits.mediaBudgetBytes - used);
+      if (bytes > 0 && remaining >= bytes) {
+        this.reservedBytes += bytes;
+        return bytes;
+      }
+      if (!this.reservedBytes) throw invalidMedia('图片总量已达到本次备份上限，请缩小备份范围');
+      const changed = this.capacityChanged;
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          signal?.removeEventListener('abort', onAbort);
+          reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        changed.then(() => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        });
+      });
+    }
+  }
+
+  async captureTarget(target, pid, signal) {
+    const key = mediaTargetKey(target);
+    const existing = this.records.get(key);
+    if (existing?.status === 'available') {
+      const bytes = await this.store.getMediaFile(this.jobId, existing.sha256);
+      if (await verifyStoredMedia(existing, bytes, this.verified.has(existing.sha256) ? existing.sha256 : null)) {
+        this.verified.add(existing.sha256);
+        return existing;
+      }
+      this.fileSizes.delete(existing.sha256);
+    }
+    const shared = target.remoteId && [...this.records.values()].find((record) =>
+      record.remoteId === target.remoteId && record.status === 'available' && this.verified.has(record.sha256));
+    if (shared) return shared;
+    const missing = { ...target, pid: String(pid), status: 'missing' };
+    await this.store.putMedia(this.jobId, missing);
+    this.records.set(key, missing);
+    let reserved = 0;
+    try {
+      reserved = await this.reserveCapacity(signal);
+      const result = await this.api.downloadMedia(target.remoteId, pid, signal, reserved, { shouldPause: this.shouldPause });
+      throwIfAborted(signal, 'capture_media');
+      const type = detectImageType(result.bytes);
+      if (!type || !result.bytes.length || result.bytes.length > reserved) {
+        throw invalidMedia('图片内容无效或超过本次备份上限');
+      }
+      const sha256 = await mediaSHA256(result.bytes);
+      throwIfAborted(signal, 'capture_media');
+      const available = { ...target, pid: String(pid), status: 'available', sha256,
+        size: result.bytes.length, mimeType: type.mimeType, path: `media/${sha256}${type.extension}` };
+      await this.store.putMedia(this.jobId, available, result.bytes);
+      this.records.set(key, available);
+      this.fileSizes.set(sha256, available.size);
+      this.verified.add(sha256);
+      return available;
+    } catch (error) {
+      if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED,
+        ERROR_CODES.STORAGE_ERROR, ERROR_CODES.PAUSED].includes(error.code)) throw error;
+      const record = { ...missing, error: toErrorRecord(error, { pid: String(pid), phase: 'media',
+        ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId }) };
+      await this.store.putMedia(this.jobId, record);
+      this.records.set(key, record);
+      return record;
+    } finally {
+      if (reserved) this.releaseCapacity(reserved);
+    }
+  }
+
   async capture(hole, comments, pid, signal) {
     for (const target of mediaTargets(hole, comments)) {
       throwIfAborted(signal, 'capture_media');
@@ -545,59 +755,19 @@ class MediaCapture {
       const key = mediaTargetKey(target);
       if (this.attempted.has(key)) continue;
       this.attempted.add(key);
-      const existing = this.records.get(key);
-      if (existing?.status === 'available') {
-        const bytes = await this.store.getMediaFile(this.jobId, existing.sha256);
-        if (await verifyStoredMedia(existing, bytes, this.verified.has(existing.sha256) ? existing.sha256 : null)) {
-          this.verified.add(existing.sha256);
-          continue;
-        }
-        this.fileSizes.delete(existing.sha256);
-      }
-      // The media ID identifies the same remote object across owners. Reuse
-      // verified bytes while retaining a separate ownership index entry.
-      const shared = target.remoteId && [...this.records.values()].find((record) =>
-        record.remoteId === target.remoteId && record.status === 'available' && this.verified.has(record.sha256));
-      if (shared) {
-        const record = { ...shared, ...target, pid: String(pid) };
-        await this.store.putMedia(this.jobId, record);
-        this.records.set(key, record);
-        continue;
-      }
-      const missing = { ...target, pid: String(pid), status: 'missing' };
-      await this.store.putMedia(this.jobId, missing);
-      this.records.set(key, missing);
-      let result;
-      try {
-        const used = [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0);
-        const remaining = this.limits.mediaBudgetBytes - used;
-        if (remaining <= 0) throw invalidMedia('图片总量已达到本次备份上限，请缩小备份范围');
-        result = await this.api.downloadMedia(target.remoteId, pid, signal,
-          Math.min(this.limits.maxMediaBytes, remaining));
-        throwIfAborted(signal, 'capture_media');
-        const type = detectImageType(result.bytes);
-        if (!type || !result.bytes.length || result.bytes.length > Math.min(this.limits.maxMediaBytes, remaining)) {
-          throw invalidMedia('图片内容无效或超过本次备份上限');
-        }
-        const sha256 = await mediaSHA256(result.bytes);
-        const available = { ...target, pid: String(pid), status: 'available', sha256,
-          size: result.bytes.length, mimeType: type.mimeType, path: `media/${sha256}${type.extension}` };
-        await this.store.putMedia(this.jobId, available, result.bytes);
-        this.records.set(key, available);
-        this.fileSizes.set(sha256, available.size);
-        this.verified.add(sha256);
-      } catch (error) {
-        if ([ERROR_CODES.UNAUTHORIZED, ERROR_CODES.RATE_LIMITED, ERROR_CODES.CANCELLED, ERROR_CODES.STORAGE_ERROR].includes(error.code)) {
-          throw error;
-        }
-        const record = { ...missing, error: toErrorRecord(error, { pid: String(pid), phase: 'media',
-          ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId }) };
-        await this.store.putMedia(this.jobId, record);
-        this.records.set(key, record);
-      }
+      // Share in-flight downloads across post/comment owners, including failures.
+      const remoteKey = target.remoteId ? `id:${target.remoteId}` : `pid:${pid}`;
+      if (!this.downloads.has(remoteKey)) this.downloads.set(remoteKey, this.captureTarget(target, pid, signal));
+      const captured = await this.downloads.get(remoteKey);
+      throwIfAborted(signal, 'capture_media');
+      const record = { ...captured, ...target, pid: String(pid) };
+      if (captured.error) record.error = { ...captured.error, pid: String(pid),
+        ownerType: target.ownerType, ownerId: target.ownerId, remoteId: target.remoteId };
+      if (mediaTargetKey(captured) !== key) await this.store.putMedia(this.jobId, record);
+      this.records.set(key, record);
       this.onProgress({ type: 'media', pid: String(pid),
-        mediaAvailable: [...this.records.values()].filter((record) => record.status === 'available').length,
-        mediaMissing: [...this.records.values()].filter((record) => record.status === 'missing').length,
+        mediaAvailable: [...this.records.values()].filter((value) => value.status === 'available').length,
+        mediaMissing: [...this.records.values()].filter((value) => value.status === 'missing').length,
         mediaBytes: [...this.fileSizes.values()].reduce((sum, size) => sum + size, 0) });
     }
   }
@@ -675,7 +845,7 @@ function unwrapPayload(payload, operation) {
   return payload.data ?? payload;
 }
 
-function normalizePaginator(value, operation, fallbackPage = 1) {
+function normalizePaginator(value, operation, fallbackPage = 1, requestedSize = null) {
   if (Array.isArray(value)) {
     return { items: value, nextPage: null, lastPage: 1, total: value.length };
   }
@@ -686,25 +856,32 @@ function normalizePaginator(value, operation, fallbackPage = 1) {
     });
   }
   const currentPage = Number(value.current_page || fallbackPage);
-  const parsedLastPage = Number(value.last_page);
-  const lastPage = Number.isFinite(parsedLastPage)
+  if (!Number.isInteger(currentPage) || currentPage !== fallbackPage) {
+    throw new AppError(ERROR_CODES.INVALID_RESPONSE, 'API 返回了错误的分页页码', { operation });
+  }
+  const parsedLastPage = value.last_page == null ? NaN : Number(value.last_page);
+  const lastPage = Number.isInteger(parsedLastPage) && parsedLastPage >= currentPage
     ? parsedLastPage
     : value.next_page_url
       ? Number.POSITIVE_INFINITY
       : currentPage;
   return {
     items: value.data,
-    nextPage: value.next_page_url ? currentPage + 1 : null,
+    nextPage: value.next_page_url || currentPage < lastPage ? currentPage + 1 : null,
     lastPage,
-    total: Number.isFinite(Number(value.total)) ? Number(value.total) : null,
+    total: value.total != null && Number.isInteger(Number(value.total)) && Number(value.total) >= 0
+      ? Number(value.total) : null,
+    pageSize: Number.isInteger(Number(value.per_page)) && Number(value.per_page) > 0
+      ? Math.min(requestedSize, Number(value.per_page)) : requestedSize,
   };
 }
 
 class TreeholeApi {
-  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null }) {
+  constructor({ scheduler, credentialsProvider, expectedAccountFingerprint = null, pageSizes = null }) {
     this.scheduler = scheduler;
     this.credentialsProvider = credentialsProvider;
     this.expectedAccountFingerprint = expectedAccountFingerprint;
+    this.pageSizes = pageSizes || { followed: LIMITS.followedPageSize, comments: LIMITS.commentPageSize };
   }
 
   forAccount(accountFingerprint) {
@@ -716,10 +893,11 @@ class TreeholeApi {
       scheduler: this.scheduler,
       credentialsProvider: this.credentialsProvider,
       expectedAccountFingerprint,
+      pageSizes: this.pageSizes,
     });
   }
 
-  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes) {
+  async downloadMedia(remoteId, pidValue, signal, maxBytes = LIMITS.maxMediaBytes, { shouldPause } = {}) {
     const pid = normalizePid(pidValue);
     const id = String(remoteId ?? '').trim();
     if (id && !/^\d+$/.test(id)) {
@@ -728,6 +906,7 @@ class TreeholeApi {
     const url = new URL('/chapi/api/v3/media/getImageBinary', API_ORIGIN);
     url.searchParams.set(id ? 'id' : 'pid', id || pid);
     const beforeAttempt = async () => {
+      if (shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: 'download_media' });
       const credentials = await this.credentialsProvider();
       if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
         throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，媒体任务已停止', {
@@ -747,21 +926,22 @@ class TreeholeApi {
     }, {
       operation: 'download_media',
       signal,
+      shouldPause,
       beforeAttempt,
       readBody: (response) => readMediaResponse(response, maxBytes),
     });
   }
 
-  async request(path, { params, method = 'GET', kind = 'read', signal, operation }) {
-    const credentials = await this.credentialsProvider();
-    if (
-      this.expectedAccountFingerprint &&
-      credentials.accountFingerprint !== this.expectedAccountFingerprint
-    ) {
-      throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', {
-        operation,
-      });
-    }
+  async request(path, { params, method = 'GET', kind = 'read', signal, operation, shouldPause }) {
+    const currentCredentials = async () => {
+      if (shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation });
+      const credentials = await this.credentialsProvider();
+      if (this.expectedAccountFingerprint && credentials.accountFingerprint !== this.expectedAccountFingerprint) {
+        throw new AppError(ERROR_CODES.UNAUTHORIZED, '登录账号已切换，任务已停止以避免跨账号操作', { operation });
+      }
+      return credentials;
+    };
+    const credentials = await currentCredentials();
     const body = await this.scheduler.requestJson(
       apiUrl(path, params),
       {
@@ -771,7 +951,7 @@ class TreeholeApi {
         referrer: 'https://treehole.pku.edu.cn/web/',
         referrerPolicy: 'strict-origin-when-cross-origin',
       },
-      { operation, kind, signal },
+      { operation, kind, signal, shouldPause, beforeSend: async () => ({ headers: createAuthHeaders(await currentCredentials()) }) },
     );
     return unwrapPayload(body, operation);
   }
@@ -789,29 +969,49 @@ class TreeholeApi {
     }));
   }
 
-  async listFollowedPage({ page, limit = 25, bookmarkId, signal }) {
-    const value = await this.request('/follow_v2', {
+  async readPage(path, options, category, legacySize) {
+    let size = options.params.limit;
+    let value;
+    try {
+      value = await this.request(path, options);
+    } catch (error) {
+      const rejectsLimit = /limit|per.page|分页|每页|条数/i.test(`${error.message} ${JSON.stringify(error.details)}`);
+      const canFallBack = [400, 422].includes(error.status) ||
+        (error.status == null && error.code === ERROR_CODES.BUSINESS_ERROR);
+      if (size <= legacySize || !rejectsLimit || !canFallBack) throw error;
+      size = legacySize;
+      this.pageSizes[category] = size;
+      value = await this.request(path, { ...options, params: { ...options.params, limit: size } });
+    }
+    const result = normalizePaginator(value, options.operation, options.params.page, size);
+    if (result.pageSize) this.pageSizes[category] = result.pageSize;
+    return { ...result, pageSize: result.pageSize || size };
+  }
+
+  async listFollowedPage({ page, limit = this.pageSizes.followed, bookmarkId, signal, shouldPause }) {
+    return this.readPage('/follow_v2', {
       params: { page, limit, bookmark_id: bookmarkId },
       signal,
+      shouldPause,
       operation: 'list_followed',
-    });
-    return normalizePaginator(value, 'list_followed', page);
+    }, 'followed', 25);
   }
 
-  async listCommentsPage(pidValue, { page, limit = 15, signal }) {
+  async listCommentsPage(pidValue, { page, limit = this.pageSizes.comments, signal, shouldPause }) {
     const pid = normalizePid(pidValue);
-    const value = await this.request(`/pku_comment_v3/${encodeURIComponent(pid)}`, {
+    return this.readPage(`/pku_comment_v3/${encodeURIComponent(pid)}`, {
       params: { page, limit, sort: 'asc' },
       signal,
+      shouldPause,
       operation: 'list_comments',
-    });
-    return normalizePaginator(value, 'list_comments', page);
+    }, 'comments', 15);
   }
 
-  async getHole(pidValue, signal) {
+  async getHole(pidValue, signal, { shouldPause } = {}) {
     const pid = normalizePid(pidValue);
     const hole = await this.request(`/pku/${encodeURIComponent(pid)}/`, {
       signal,
+      shouldPause,
       operation: 'get_hole',
     });
     if (!hole || Array.isArray(hole) || String(hole.pid) !== pid) {
@@ -822,13 +1022,27 @@ class TreeholeApi {
     return hole;
   }
 
-  async getAllFollowed({ bookmarkId = null, signal, onPage = () => {} } = {}) {
+  async getAllFollowed({ bookmarkId = null, signal, onPage = () => {}, shouldPause = () => false } = {}) {
     const seen = new Map();
     let page = 1;
     let expectedTotal = null;
+    let pageSize = this.pageSizes.followed;
+    let reason = 'followed_page_limit';
     while (page <= LIMITS.followedPages) {
-      const result = await this.listFollowedPage({ page, bookmarkId, signal });
+      if (shouldPause()) { reason = 'paused'; break; }
+      let result;
+      try {
+        result = await this.listFollowedPage({ page, bookmarkId, signal, shouldPause });
+      } catch (error) {
+        if (!isAppError(error, ERROR_CODES.PAUSED)) throw error;
+        reason = 'paused'; break;
+      }
+      if (page > 1 && result.pageSize !== pageSize) {
+        seen.clear(); page = 1; pageSize = result.pageSize; continue;
+      }
+      pageSize = result.pageSize;
       expectedTotal = result.total ?? expectedTotal;
+      const previousCount = seen.size;
       for (const hole of result.items) {
         if (hole?.pid) seen.set(String(hole.pid), hole);
       }
@@ -842,25 +1056,40 @@ class TreeholeApi {
           reason: complete ? null : 'followed_count_mismatch',
         };
       }
+      if (seen.size === previousCount) { reason = 'followed_no_progress'; break; }
       page = result.nextPage;
     }
     return {
       items: [...seen.values()],
       expectedTotal,
       complete: false,
-      reason: 'followed_page_limit',
+      reason,
     };
   }
 
-  async getAllComments(pidValue, { signal, onPage = () => {} } = {}) {
+  async getAllComments(pidValue, { signal, onPage = () => {}, shouldPause = () => false } = {}) {
     const pid = normalizePid(pidValue);
     const seen = new Map();
     const unkeyed = [];
     let page = 1;
     let expectedTotal = null;
+    let pageSize = this.pageSizes.comments;
+    let reason = 'comment_page_limit';
     while (page <= LIMITS.commentPages) {
-      const result = await this.listCommentsPage(pid, { page, signal });
+      if (shouldPause()) { reason = 'paused'; break; }
+      let result;
+      try {
+        result = await this.listCommentsPage(pid, { page, signal, shouldPause });
+      } catch (error) {
+        if (!isAppError(error, ERROR_CODES.PAUSED)) throw error;
+        reason = 'paused'; break;
+      }
+      if (page > 1 && result.pageSize !== pageSize) {
+        seen.clear(); unkeyed.length = 0; page = 1; pageSize = result.pageSize; continue;
+      }
+      pageSize = result.pageSize;
       expectedTotal = result.total ?? expectedTotal;
+      const previousCount = seen.size + unkeyed.length;
       for (const comment of result.items) {
         const key = comment?.cid ?? comment?.id;
         if (key === undefined || key === null) unkeyed.push(comment);
@@ -877,13 +1106,14 @@ class TreeholeApi {
           reason: complete ? null : 'comment_count_mismatch',
         };
       }
+      if (seen.size + unkeyed.length === previousCount) { reason = 'comment_no_progress'; break; }
       page = result.nextPage;
     }
     return {
       items: [...seen.values(), ...unkeyed],
       expectedTotal,
       complete: false,
-      reason: 'comment_page_limit',
+      reason,
     };
   }
 
@@ -2447,10 +2677,12 @@ class ExportJob {
     this.pauseRequested = false;
     this.controller = null;
     this.jobId = null;
+    this.progressWrites = Promise.resolve();
   }
 
   requestPause() {
     this.pauseRequested = true;
+    this.api.scheduler?.pausePending?.();
   }
 
   cancel() {
@@ -2462,42 +2694,60 @@ class ExportJob {
   }
 
   async saveState(job, state, patch = {}) {
+    await this.progressWrites;
     Object.assign(job, patch, { state });
     await this.store.putJob(job);
     this.emit({ type: 'state', state, jobId: job.id, ...patch });
   }
 
+  async runWorkers(items, signal, callback) {
+    let next = 0;
+    let failure = null;
+    const worker = async () => {
+      try {
+        while (next < items.length && !this.pauseRequested && !failure) {
+          throwIfAborted(signal, 'export');
+          const item = items[next++];
+          await callback(item);
+        }
+      } catch (error) {
+        if (!failure) failure = error;
+        this.controller?.abort(error);
+      }
+    };
+    // Always drain workers before persisting the terminal state.
+    await Promise.all(Array.from({ length: Math.min(LIMITS.exportWorkers, items.length) }, worker));
+    if (failure) throw failure;
+    throwIfAborted(signal, 'export');
+  }
+
+  recordProgress(job, completedPids, errors, phase, pid) {
+    const completed = completedPids.size;
+    const savedErrors = [...errors];
+    this.progressWrites = this.progressWrites.then(async () => {
+      Object.assign(job, { completed, errors: savedErrors });
+      await this.store.putJob({ ...job, errors: savedErrors });
+      this.emit({ ...job, type: 'progress', phase, pid });
+    });
+    return this.progressWrites;
+  }
+
   async planHoles(options, signal) {
     if (options.scope.type === 'pids') {
-      const holes = [];
-      const errors = [];
-      for (const pid of options.scope.pids) {
-        throwIfAborted(signal, 'plan_explicit_pids');
-        try {
-          const saved = this.existingItems.get(pid);
-          holes.push(saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal));
-        } catch (error) {
-          if (
-            isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
-            isAppError(error, ERROR_CODES.RATE_LIMITED) ||
-            isAppError(error, ERROR_CODES.CANCELLED)
-          ) {
-            throw error;
-          }
-          errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
-        }
-      }
-      return { holes, complete: errors.length === 0, errors };
+      // Workers fetch details and comments together, rather than serially
+      // fetching all details before any comment work can start.
+      return { holes: options.scope.pids.map((pid) => ({ pid })), complete: true, errors: [] };
     }
     const result = await this.api.getAllFollowed({
       bookmarkId: options.scope.type === 'group' ? options.scope.bookmarkId : null,
       signal,
+      shouldPause: () => this.pauseRequested,
       onPage: (progress) => this.emit({ type: 'planning', ...progress }),
     });
     return {
       holes: filterByDate(result.items, options.scope),
       complete: result.complete,
-      errors: result.complete
+      errors: result.complete || result.reason === 'paused'
         ? []
         : [
             {
@@ -2505,7 +2755,9 @@ class ExportJob {
               message:
                 result.reason === 'followed_count_mismatch'
                   ? '关注列表实际数量与服务端总数不一致'
-                  : '关注列表达到安全页数上限',
+                  : result.reason === 'followed_no_progress'
+                    ? '关注分页重复或没有新增记录，备份不完整'
+                    : '关注列表达到安全页数上限',
               phase: 'followed',
               retryable: true,
             },
@@ -2530,7 +2782,7 @@ class ExportJob {
     await this.store.putItem(job.id, pid, item);
     if (!detailComplete) {
       try {
-        hole = await this.api.getHole(pid, signal);
+        hole = await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested });
         detailComplete = true;
         contentComplete = !options.includeComments;
       } catch (error) {
@@ -2547,14 +2799,18 @@ class ExportJob {
       try {
         const result = await this.api.getAllComments(pid, {
           signal,
-          onPage: (progress) => this.emit({ type: 'comments', pid, ...progress }),
+          shouldPause: () => this.pauseRequested,
+          onPage: (progress) => this.emit({
+            type: 'comments', pid, total: job.total, completed: job.completed,
+            commentCount: progress.count, commentTotal: progress.total,
+          }),
         });
         comments = result.items;
         const expectedComments = Number(hole.reply);
         const belowDetailCount = detailComplete && Number.isSafeInteger(expectedComments) &&
           expectedComments > comments.length;
         contentComplete = detailComplete && result.complete && !belowDetailCount;
-        if (!result.complete || belowDetailCount) {
+        if ((!result.complete || belowDetailCount) && result.reason !== 'paused') {
           errors.push({
             code: ERROR_CODES.INVALID_RESPONSE,
             message:
@@ -2562,7 +2818,9 @@ class ExportJob {
                 ? `#${pid} 实际保存 ${comments.length} 条评论，少于详情记录的 ${expectedComments} 条`
                 : result.reason === 'comment_count_mismatch'
                 ? `#${pid} 评论实际数量与服务端总数不一致`
-                : `#${pid} 评论达到安全页数上限`,
+                : result.reason === 'comment_no_progress'
+                  ? `#${pid} 评论分页重复或没有新增记录`
+                  : `#${pid} 评论达到安全页数上限`,
             pid,
             phase: 'comments',
             retryable: true,
@@ -2582,9 +2840,11 @@ class ExportJob {
       }
     }
 
+    throwIfAborted(signal, 'export');
     item = snapshot();
     await this.store.putItem(job.id, pid, item);
     if (options.includeMedia) await this.mediaCapture.capture(null, comments, pid, signal);
+    throwIfAborted(signal, 'export');
     item.mediaComplete = !options.includeMedia || this.mediaCapture.complete(hole, comments);
     item.fetchStatus = contentComplete && item.mediaComplete ? 'ok' : 'partial';
     await this.store.putItem(job.id, pid, item);
@@ -2642,6 +2902,7 @@ class ExportJob {
     this.controller = new AbortController();
     const onExternalAbort = () => this.controller.abort(externalSignal.reason);
     externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    if (externalSignal?.aborted) onExternalAbort();
     const signal = this.controller.signal;
     if (externalSignal?.aborted) this.controller.abort(externalSignal.reason);
     this.api.scheduler?.resetRateLimitCount?.();
@@ -2651,19 +2912,28 @@ class ExportJob {
       const existingItems = await this.store.getItems(job.id);
       this.existingItems = new Map(existingItems.map((item) => [item.pid, item]));
       const plan = await this.planHoles(options, signal);
-      const basePids = new Set(plan.holes.map((hole) => String(hole.pid)));
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED);
+        return { job, paused: true };
+      }
+      const baseHoles = new Map(plan.holes.map((hole) => [normalizePid(hole.pid), hole]));
+      for (const item of existingItems) {
+        if (item.source !== 'referenced' && !baseHoles.has(item.pid)) baseHoles.set(item.pid, item.hole);
+      }
+      const basePids = new Set(baseHoles.keys());
       if (options.includeMedia) {
         this.mediaCapture = new MediaCapture({ api: this.api, store: this.store, jobId: job.id,
-          limits: this.limits, onProgress: (event) => this.emit(event), checkPause: () => this.checkPause(signal) });
+          limits: this.limits, onProgress: (event) => this.emit(event), shouldPause: () => this.pauseRequested, checkPause: () => this.checkPause(signal) });
         await this.mediaCapture.initialize();
       }
       const completedPids = new Set(
         existingItems.filter((item) => item.fetchStatus === 'ok' && item.detailComplete === true)
           .map((item) => item.pid),
       );
+      const progressPids = new Set([...completedPids].filter((pid) => basePids.has(pid)));
       const errors = [...plan.errors];
-      job.total = plan.holes.length;
-      job.completed = completedPids.size;
+      job.total = baseHoles.size;
+      job.completed = progressPids.size;
       await this.saveState(job, JOB_STATES.RUNNING, {
         total: job.total,
         completed: job.completed,
@@ -2672,7 +2942,7 @@ class ExportJob {
       const references = new Set();
       if (options.referenceMode !== 'none') {
         for (const item of existingItems) {
-          if (item.detailComplete !== true) continue;
+          if (!basePids.has(item.pid) || item.detailComplete !== true) continue;
           referencesFromText(item.hole?.text).forEach((reference) => references.add(reference));
           if (options.referenceMode === 'all') {
             item.comments?.forEach((comment) =>
@@ -2681,14 +2951,13 @@ class ExportJob {
           }
         }
       }
-      for (const hole of plan.holes) {
-        throwIfAborted(signal, 'export');
-        if (this.pauseRequested) {
-          await this.saveState(job, JOB_STATES.PAUSED, { errors });
-          return { job, paused: true };
-        }
-        const pid = normalizePid(hole.pid);
-        if (!completedPids.has(pid) || options.includeMedia) {
+      await this.runWorkers([...baseHoles], signal, async ([pid, listedHole]) => {
+        if (completedPids.has(pid) && !options.includeMedia) return;
+        try {
+          const saved = this.existingItems.get(pid);
+          const hole = options.scope.type === 'pids'
+            ? saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested })
+            : listedHole;
           const itemErrors = await this.processHole({
             job,
             hole,
@@ -2699,10 +2968,17 @@ class ExportJob {
           });
           errors.push(...itemErrors);
           completedPids.add(pid);
-          job.completed = completedPids.size;
-          await this.store.putJob({ ...job, completed: job.completed, errors });
-          this.emit({ ...job, type: 'progress', phase: 'followed', pid });
+        } catch (error) {
+          if (isAppError(error, ERROR_CODES.PAUSED)) return;
+          if (isAppError(error, ERROR_CODES.UNAUTHORIZED) || isAppError(error, ERROR_CODES.RATE_LIMITED) || isAppError(error, ERROR_CODES.CANCELLED) || isAppError(error, ERROR_CODES.STORAGE_ERROR)) throw error;
+          errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
         }
+        progressPids.add(pid);
+        await this.recordProgress(job, progressPids, errors, 'followed', pid);
+      });
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED, { errors });
+        return { job, paused: true };
       }
 
       for (const pid of basePids) references.delete(pid);
@@ -2714,7 +2990,7 @@ class ExportJob {
           retryable: false,
         });
       }
-      const referencePids = [...references].slice(0, LIMITS.maxReferencedPids);
+      const referencePids = [...references].sort((a, b) => Number(a) - Number(b)).slice(0, LIMITS.maxReferencedPids);
       if (
         referencePids.length > LIMITS.confirmReferencedPids &&
         !options.confirmedLargeReferences
@@ -2723,18 +2999,17 @@ class ExportJob {
         if (!confirmed) referencePids.length = 0;
       }
       job.total += referencePids.length;
+      for (const pid of referencePids) {
+        if (completedPids.has(pid)) progressPids.add(pid);
+      }
+      job.completed = progressPids.size;
       await this.store.putJob(job);
 
-      for (const pid of referencePids) {
-        throwIfAborted(signal, 'export_references');
-        if (this.pauseRequested) {
-          await this.saveState(job, JOB_STATES.PAUSED, { errors });
-          return { job, paused: true };
-        }
-        if (completedPids.has(pid) && !options.includeMedia) continue;
+      await this.runWorkers(referencePids, signal, async (pid) => {
+        if (completedPids.has(pid) && !options.includeMedia) return;
         try {
-          const hole = this.existingItems.get(pid)?.detailComplete
-            ? this.existingItems.get(pid).hole : await this.api.getHole(pid, signal);
+          const saved = this.existingItems.get(pid);
+          const hole = saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested });
           const itemErrors = await this.processHole({
             job,
             hole,
@@ -2746,23 +3021,29 @@ class ExportJob {
           errors.push(...itemErrors);
           completedPids.add(pid);
         } catch (error) {
+          if (isAppError(error, ERROR_CODES.PAUSED)) return;
           if (
             isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
             isAppError(error, ERROR_CODES.RATE_LIMITED) ||
             isAppError(error, ERROR_CODES.CANCELLED) ||
-            isAppError(error, ERROR_CODES.PAUSED) ||
             isAppError(error, ERROR_CODES.STORAGE_ERROR)
           ) {
             throw error;
           }
           errors.push(toErrorRecord(error, { pid, phase: 'referenced' }));
         }
-        job.completed = completedPids.size;
-        await this.store.putJob({ ...job, completed: job.completed, errors });
-        this.emit({ ...job, type: 'progress', phase: 'referenced', pid });
+        progressPids.add(pid);
+        await this.recordProgress(job, progressPids, errors, 'referenced', pid);
+      });
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED, { errors });
+        return { job, paused: true };
       }
 
-      const items = await this.store.getItems(job.id);
+      const order = new Map([...basePids, ...referencePids].map((pid, index) => [pid, index]));
+      const items = (await this.store.getItems(job.id))
+        .filter((item) => order.has(item.pid))
+        .sort((a, b) => order.get(a.pid) - order.get(b.pid));
       const media = options.includeMedia ? await prepareExportMedia(this.store, job.id, items) : null;
       if (media) errors.push(...media.errors);
       const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');
@@ -3837,12 +4118,30 @@ function mountToolkit({
     countLabel.textContent = `${completed} / ${total || '?'}`;
     if (event.state) setTaskStatus(event.state);
     else if (!['planning', 'previewing'].includes(taskState)) setTaskStatus('running');
-    if (event.pid) setMessage(`正在处理帖子 #${event.pid}`);
+    if (api.scheduler?.recovering) {
+      const seconds = Math.max(0, Math.ceil((api.scheduler.blockedUntil - Date.now()) / 1000));
+      setMessage(seconds ? `服务器要求等待约 ${seconds} 秒，之后会自动尝试继续。` : '正在检查服务器是否恢复，随后继续备份。');
+    } else if (event.type === 'comments') {
+      setMessage(`正在处理帖子 #${event.pid} 的评论：${event.commentCount} / ${event.commentTotal ?? '?'}；其他帖子同时进行。`);
+    } else if (event.pid) setMessage(`正在处理帖子 #${event.pid}`);
     else if (event.phase === 'archive_files') {
       setMessage(`正在读取备份文件：${completed} / ${total || '?'}…`);
     } else if (event.phase === 'remote_followed') {
       setMessage(`正在读取当前关注列表：${completed} / ${total || '?'}…`);
     }
+  }
+
+  if (api.scheduler) {
+    const previousRateLimit = api.scheduler.onRateLimit;
+    const previousRecovered = api.scheduler.onRateLimitRecovered;
+    api.scheduler.onRateLimit = (event) => {
+      previousRateLimit?.(event);
+      if (isRunning) setMessage(`服务器要求等待约 ${Math.ceil(event.retryAfter / 1000)} 秒，之后会自动尝试继续。`);
+    };
+    api.scheduler.onRateLimitRecovered = () => {
+      previousRecovered?.();
+      if (isRunning) setMessage('服务器已恢复，正在继续任务…');
+    };
   }
 
   async function ensureBookmarks() {
@@ -3981,7 +4280,7 @@ function mountToolkit({
     activeKind = 'export';
     setTaskStatus('planning');
     setRunning(true);
-    setMessage('正在读取所选范围，随后会逐个保存帖子和评论…');
+    setMessage('正在读取所选范围，随后会并行保存帖子和评论…');
     try {
       const { credentials, accountChanged } = await credentialsForCurrentAccount();
       if (accountChanged && jobId) {

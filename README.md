@@ -1,4 +1,4 @@
-# PKU Treehole Toolkit
+# PkuHoleToolkit
 
 **把北大树洞的帖子、评论和图片保存到自己的电脑，也可以在换账号时从备份迁移关注。**
 

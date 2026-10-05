@@ -39,6 +39,7 @@ export class RequestScheduler {
     random = Math.random,
     policy = REQUEST_POLICY,
     onRateLimit = () => {},
+    onRateLimitRecovered = () => {},
   } = {}) {
     if (!fetchImpl) throw new TypeError('fetchImpl is required');
     this.fetchImpl = fetchImpl;
@@ -46,39 +47,150 @@ export class RequestScheduler {
     this.now = now;
     this.random = random;
     this.policy = { ...REQUEST_POLICY, ...policy };
+    if (policy.jitterMs !== undefined) {
+      this.policy.readJitterMs = policy.jitterMs;
+      this.policy.writeJitterMs = policy.jitterMs;
+    }
     this.onRateLimit = onRateLimit;
-    this.queue = Promise.resolve();
-    this.lastStartedAt = 0;
+    this.onRateLimitRecovered = onRateLimitRecovered;
+    this.queue = [];
+    this.draining = false;
+    this.inFlight = 0;
+    this.writeInFlight = false;
+    this.lastStartedAt = null;
     this.rateLimitCount = 0;
+    this.blockedUntil = 0;
+    this.blockVersion = 0;
+    this.recovering = false;
+    this.probeLease = null;
+    this.changed = new Promise((resolve) => { this.wake = resolve; });
   }
 
   resetRateLimitCount() {
     this.rateLimitCount = 0;
   }
 
-  async enqueue(kind, signal, callback) {
-    const previous = this.queue;
-    let release;
-    this.queue = new Promise((resolve) => {
-      release = resolve;
-    });
-    await previous;
+  pausePending() {
+    for (const entry of [...this.queue]) {
+      if (!entry.shouldPause?.()) continue;
+      entry.remove();
+      entry.reject(new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: entry.operation }));
+    }
+    this.notify();
+  }
+
+  notify() {
+    this.wake();
+    this.changed = new Promise((resolve) => { this.wake = resolve; });
+  }
+
+  block(retryAfter, status) {
+    this.blockedUntil = Math.max(this.blockedUntil, this.now() + retryAfter);
+    this.blockVersion += 1;
+    this.recovering = true;
+    this.rateLimitCount += 1;
+    this.notify();
+    this.onRateLimit({ retryAfter, blockedUntil: this.blockedUntil, count: this.rateLimitCount, status });
+  }
+
+  recovered(lease) {
+    if (!this.recovering) return;
+    // An older in-flight success cannot clear a newer server cooldown.
+    if (this.probeLease !== lease || lease.blockVersion !== this.blockVersion) return;
+    this.recovering = false;
+    this.blockedUntil = 0;
+    this.rateLimitCount = 0;
+    this.notify();
+    this.onRateLimitRecovered();
+  }
+
+  async drain() {
+    if (this.draining) return;
+    this.draining = true;
     try {
-      throwIfAborted(signal);
-      const interval =
-        kind === 'write' ? this.policy.writeIntervalMs : this.policy.readIntervalMs;
-      const jitter = Math.floor(this.random() * (this.policy.jitterMs + 1));
-      const remaining = this.lastStartedAt + interval + jitter - this.now();
-      if (remaining > 0) await this.sleepImpl(remaining, signal);
-      this.lastStartedAt = this.now();
-      return await callback();
+      while (this.queue.length) {
+        const changed = this.changed;
+        const entry = this.recovering
+          ? this.queue.find((candidate) => candidate.kind === 'read')
+          : this.queue[0];
+        if (
+          !entry || this.inFlight >= this.policy.maxReadConcurrent ||
+          (entry.kind === 'write' && this.writeInFlight) ||
+          (this.recovering && this.probeLease)
+        ) {
+          await changed;
+          continue;
+        }
+        try {
+          throwIfAborted(entry.signal);
+          const interval = entry.kind === 'write' ? this.policy.writeIntervalMs : this.policy.readIntervalMs;
+          const jitterRange = entry.kind === 'write' ? this.policy.writeJitterMs : this.policy.readJitterMs;
+          const jitter = Math.floor(this.random() * (jitterRange + 1));
+          const startsAfter = this.lastStartedAt === null ? this.now() : this.lastStartedAt + interval + jitter;
+          let remaining = Math.max(startsAfter, this.blockedUntil) - this.now();
+          while (remaining > 0) {
+            await this.sleepImpl(remaining, entry.waitController.signal);
+            throwIfAborted(entry.signal);
+            remaining = Math.max(startsAfter, this.blockedUntil) - this.now();
+          }
+          if (this.recovering && (this.probeLease || entry.kind !== 'read')) continue;
+          const overrides = await entry.beforeSend?.();
+          throwIfAborted(entry.signal);
+          if (!this.queue.includes(entry)) continue;
+          if (this.now() < this.blockedUntil || (this.recovering && (this.probeLease || entry.kind !== 'read'))) continue;
+          const lease = { kind: entry.kind, blockVersion: this.blockVersion, overrides };
+          if (this.recovering) this.probeLease = lease;
+          this.inFlight += 1;
+          if (entry.kind === 'write') this.writeInFlight = true;
+          this.lastStartedAt = this.now();
+          entry.remove();
+          entry.resolve(lease);
+          // Let the admitted request start before timing the next admission.
+          await Promise.resolve();
+        } catch (error) {
+          entry.remove();
+          entry.reject(error);
+        }
+      }
     } finally {
-      release();
+      this.draining = false;
+    }
+  }
+
+  async enqueue(context, callback) {
+    throwIfAborted(context.signal);
+    if (context.shouldPause?.()) throw new AppError(ERROR_CODES.PAUSED, '任务已暂停', { operation: context.operation });
+    const lease = await new Promise((resolve, reject) => {
+      const entry = { ...context, resolve, reject, waitController: new AbortController() };
+      const onAbort = () => {
+        entry.remove();
+        reject(new AppError(ERROR_CODES.CANCELLED, '操作已取消', { operation: context.operation }));
+        this.notify();
+      };
+      entry.remove = () => {
+        const index = this.queue.indexOf(entry);
+        if (index !== -1) this.queue.splice(index, 1);
+        entry.waitController.abort('dequeued');
+        entry.signal?.removeEventListener('abort', onAbort);
+      };
+      entry.signal?.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(entry);
+      this.notify();
+      void this.drain();
+    });
+    try {
+      throwIfAborted(context.signal);
+      return await callback(lease);
+    } finally {
+      this.inFlight -= 1;
+      if (lease.kind === 'write') this.writeInFlight = false;
+      if (this.probeLease === lease) this.probeLease = null;
+      this.notify();
     }
   }
 
   async fetchAttempt(url, options, context) {
-    return this.enqueue(context.kind, context.signal, async () => {
+    return this.enqueue(context, async (lease) => {
       const controller = new AbortController();
       let externallyAborted = false;
       const onAbort = () => {
@@ -88,9 +200,17 @@ export class RequestScheduler {
       context.signal?.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => controller.abort('timeout'), this.policy.timeoutMs);
       try {
-        const refreshed = await context.beforeAttempt?.();
+        const response = await this.fetchImpl(url, { ...options, ...lease.overrides, signal: controller.signal });
+        if (response.status === 429) {
+          this.block(
+            retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now) ?? this.policy.missingRetryAfterMs,
+            429,
+          );
+        } else if (response.status === 503) {
+          const retryAfter = retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now);
+          if (retryAfter !== null) this.block(retryAfter, 503);
+        }
         throwIfAborted(context.signal, context.operation);
-        const response = await this.fetchImpl(url, { ...options, ...refreshed, signal: controller.signal });
         let body;
         try {
           if (response.ok && context.readBody) body = await context.readBody(response);
@@ -110,6 +230,10 @@ export class RequestScheduler {
               operation: context.operation,
             });
           }
+        }
+        if (response.ok && body?.success !== false && (body?.code === undefined || body.code === 20000)) {
+          throwIfAborted(context.signal, context.operation);
+          this.recovered(lease);
         }
         return { response, body };
       } catch (error) {
@@ -146,7 +270,8 @@ export class RequestScheduler {
       kind: context.kind === 'write' ? 'write' : 'read',
       signal: context.signal,
       readBody: context.readBody,
-      beforeAttempt: context.beforeAttempt,
+      beforeSend: context.beforeSend || context.beforeAttempt,
+      shouldPause: context.shouldPause,
     };
     const maxAttempts =
       normalized.kind === 'write' ? 1 : Math.max(1, this.policy.maxReadAttempts);
@@ -172,12 +297,10 @@ export class RequestScheduler {
           });
         }
         if (status === 429) {
-          this.rateLimitCount += 1;
           const retryAfter =
             retryAfterMilliseconds(response.headers?.get?.('Retry-After'), this.now) ??
             this.policy.missingRetryAfterMs;
-          this.onRateLimit({ retryAfter, count: this.rateLimitCount });
-          if (this.rateLimitCount >= 2 || normalized.kind === 'write') {
+          if (attempt === maxAttempts || normalized.kind === 'write') {
             throw new AppError(ERROR_CODES.RATE_LIMITED, '请求过于频繁，任务已暂停', {
               status,
               retryable: true,
@@ -185,10 +308,8 @@ export class RequestScheduler {
               details: { retryAfter },
             });
           }
-          if (attempt < maxAttempts) {
-            await this.sleepImpl(retryAfter, normalized.signal);
-            continue;
-          }
+          // Re-enter the shared gate; one read probes before the queue resumes.
+          continue;
         }
 
         throw new AppError(ERROR_CODES.BUSINESS_ERROR, `HTTP ${status}`, {

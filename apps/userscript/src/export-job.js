@@ -146,10 +146,12 @@ export class ExportJob {
     this.pauseRequested = false;
     this.controller = null;
     this.jobId = null;
+    this.progressWrites = Promise.resolve();
   }
 
   requestPause() {
     this.pauseRequested = true;
+    this.api.scheduler?.pausePending?.();
   }
 
   cancel() {
@@ -161,42 +163,60 @@ export class ExportJob {
   }
 
   async saveState(job, state, patch = {}) {
+    await this.progressWrites;
     Object.assign(job, patch, { state });
     await this.store.putJob(job);
     this.emit({ type: 'state', state, jobId: job.id, ...patch });
   }
 
+  async runWorkers(items, signal, callback) {
+    let next = 0;
+    let failure = null;
+    const worker = async () => {
+      try {
+        while (next < items.length && !this.pauseRequested && !failure) {
+          throwIfAborted(signal, 'export');
+          const item = items[next++];
+          await callback(item);
+        }
+      } catch (error) {
+        if (!failure) failure = error;
+        this.controller?.abort(error);
+      }
+    };
+    // Always drain workers before persisting the terminal state.
+    await Promise.all(Array.from({ length: Math.min(LIMITS.exportWorkers, items.length) }, worker));
+    if (failure) throw failure;
+    throwIfAborted(signal, 'export');
+  }
+
+  recordProgress(job, completedPids, errors, phase, pid) {
+    const completed = completedPids.size;
+    const savedErrors = [...errors];
+    this.progressWrites = this.progressWrites.then(async () => {
+      Object.assign(job, { completed, errors: savedErrors });
+      await this.store.putJob({ ...job, errors: savedErrors });
+      this.emit({ ...job, type: 'progress', phase, pid });
+    });
+    return this.progressWrites;
+  }
+
   async planHoles(options, signal) {
     if (options.scope.type === 'pids') {
-      const holes = [];
-      const errors = [];
-      for (const pid of options.scope.pids) {
-        throwIfAborted(signal, 'plan_explicit_pids');
-        try {
-          const saved = this.existingItems.get(pid);
-          holes.push(saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal));
-        } catch (error) {
-          if (
-            isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
-            isAppError(error, ERROR_CODES.RATE_LIMITED) ||
-            isAppError(error, ERROR_CODES.CANCELLED)
-          ) {
-            throw error;
-          }
-          errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
-        }
-      }
-      return { holes, complete: errors.length === 0, errors };
+      // Workers fetch details and comments together, rather than serially
+      // fetching all details before any comment work can start.
+      return { holes: options.scope.pids.map((pid) => ({ pid })), complete: true, errors: [] };
     }
     const result = await this.api.getAllFollowed({
       bookmarkId: options.scope.type === 'group' ? options.scope.bookmarkId : null,
       signal,
+      shouldPause: () => this.pauseRequested,
       onPage: (progress) => this.emit({ type: 'planning', ...progress }),
     });
     return {
       holes: filterByDate(result.items, options.scope),
       complete: result.complete,
-      errors: result.complete
+      errors: result.complete || result.reason === 'paused'
         ? []
         : [
             {
@@ -204,7 +224,9 @@ export class ExportJob {
               message:
                 result.reason === 'followed_count_mismatch'
                   ? '关注列表实际数量与服务端总数不一致'
-                  : '关注列表达到安全页数上限',
+                  : result.reason === 'followed_no_progress'
+                    ? '关注分页重复或没有新增记录，备份不完整'
+                    : '关注列表达到安全页数上限',
               phase: 'followed',
               retryable: true,
             },
@@ -229,7 +251,7 @@ export class ExportJob {
     await this.store.putItem(job.id, pid, item);
     if (!detailComplete) {
       try {
-        hole = await this.api.getHole(pid, signal);
+        hole = await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested });
         detailComplete = true;
         contentComplete = !options.includeComments;
       } catch (error) {
@@ -246,14 +268,18 @@ export class ExportJob {
       try {
         const result = await this.api.getAllComments(pid, {
           signal,
-          onPage: (progress) => this.emit({ type: 'comments', pid, ...progress }),
+          shouldPause: () => this.pauseRequested,
+          onPage: (progress) => this.emit({
+            type: 'comments', pid, total: job.total, completed: job.completed,
+            commentCount: progress.count, commentTotal: progress.total,
+          }),
         });
         comments = result.items;
         const expectedComments = Number(hole.reply);
         const belowDetailCount = detailComplete && Number.isSafeInteger(expectedComments) &&
           expectedComments > comments.length;
         contentComplete = detailComplete && result.complete && !belowDetailCount;
-        if (!result.complete || belowDetailCount) {
+        if ((!result.complete || belowDetailCount) && result.reason !== 'paused') {
           errors.push({
             code: ERROR_CODES.INVALID_RESPONSE,
             message:
@@ -261,7 +287,9 @@ export class ExportJob {
                 ? `#${pid} 实际保存 ${comments.length} 条评论，少于详情记录的 ${expectedComments} 条`
                 : result.reason === 'comment_count_mismatch'
                 ? `#${pid} 评论实际数量与服务端总数不一致`
-                : `#${pid} 评论达到安全页数上限`,
+                : result.reason === 'comment_no_progress'
+                  ? `#${pid} 评论分页重复或没有新增记录`
+                  : `#${pid} 评论达到安全页数上限`,
             pid,
             phase: 'comments',
             retryable: true,
@@ -281,9 +309,11 @@ export class ExportJob {
       }
     }
 
+    throwIfAborted(signal, 'export');
     item = snapshot();
     await this.store.putItem(job.id, pid, item);
     if (options.includeMedia) await this.mediaCapture.capture(null, comments, pid, signal);
+    throwIfAborted(signal, 'export');
     item.mediaComplete = !options.includeMedia || this.mediaCapture.complete(hole, comments);
     item.fetchStatus = contentComplete && item.mediaComplete ? 'ok' : 'partial';
     await this.store.putItem(job.id, pid, item);
@@ -341,6 +371,7 @@ export class ExportJob {
     this.controller = new AbortController();
     const onExternalAbort = () => this.controller.abort(externalSignal.reason);
     externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    if (externalSignal?.aborted) onExternalAbort();
     const signal = this.controller.signal;
     if (externalSignal?.aborted) this.controller.abort(externalSignal.reason);
     this.api.scheduler?.resetRateLimitCount?.();
@@ -350,19 +381,28 @@ export class ExportJob {
       const existingItems = await this.store.getItems(job.id);
       this.existingItems = new Map(existingItems.map((item) => [item.pid, item]));
       const plan = await this.planHoles(options, signal);
-      const basePids = new Set(plan.holes.map((hole) => String(hole.pid)));
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED);
+        return { job, paused: true };
+      }
+      const baseHoles = new Map(plan.holes.map((hole) => [normalizePid(hole.pid), hole]));
+      for (const item of existingItems) {
+        if (item.source !== 'referenced' && !baseHoles.has(item.pid)) baseHoles.set(item.pid, item.hole);
+      }
+      const basePids = new Set(baseHoles.keys());
       if (options.includeMedia) {
         this.mediaCapture = new MediaCapture({ api: this.api, store: this.store, jobId: job.id,
-          limits: this.limits, onProgress: (event) => this.emit(event), checkPause: () => this.checkPause(signal) });
+          limits: this.limits, onProgress: (event) => this.emit(event), shouldPause: () => this.pauseRequested, checkPause: () => this.checkPause(signal) });
         await this.mediaCapture.initialize();
       }
       const completedPids = new Set(
         existingItems.filter((item) => item.fetchStatus === 'ok' && item.detailComplete === true)
           .map((item) => item.pid),
       );
+      const progressPids = new Set([...completedPids].filter((pid) => basePids.has(pid)));
       const errors = [...plan.errors];
-      job.total = plan.holes.length;
-      job.completed = completedPids.size;
+      job.total = baseHoles.size;
+      job.completed = progressPids.size;
       await this.saveState(job, JOB_STATES.RUNNING, {
         total: job.total,
         completed: job.completed,
@@ -371,7 +411,7 @@ export class ExportJob {
       const references = new Set();
       if (options.referenceMode !== 'none') {
         for (const item of existingItems) {
-          if (item.detailComplete !== true) continue;
+          if (!basePids.has(item.pid) || item.detailComplete !== true) continue;
           referencesFromText(item.hole?.text).forEach((reference) => references.add(reference));
           if (options.referenceMode === 'all') {
             item.comments?.forEach((comment) =>
@@ -380,14 +420,13 @@ export class ExportJob {
           }
         }
       }
-      for (const hole of plan.holes) {
-        throwIfAborted(signal, 'export');
-        if (this.pauseRequested) {
-          await this.saveState(job, JOB_STATES.PAUSED, { errors });
-          return { job, paused: true };
-        }
-        const pid = normalizePid(hole.pid);
-        if (!completedPids.has(pid) || options.includeMedia) {
+      await this.runWorkers([...baseHoles], signal, async ([pid, listedHole]) => {
+        if (completedPids.has(pid) && !options.includeMedia) return;
+        try {
+          const saved = this.existingItems.get(pid);
+          const hole = options.scope.type === 'pids'
+            ? saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested })
+            : listedHole;
           const itemErrors = await this.processHole({
             job,
             hole,
@@ -398,10 +437,17 @@ export class ExportJob {
           });
           errors.push(...itemErrors);
           completedPids.add(pid);
-          job.completed = completedPids.size;
-          await this.store.putJob({ ...job, completed: job.completed, errors });
-          this.emit({ ...job, type: 'progress', phase: 'followed', pid });
+        } catch (error) {
+          if (isAppError(error, ERROR_CODES.PAUSED)) return;
+          if (isAppError(error, ERROR_CODES.UNAUTHORIZED) || isAppError(error, ERROR_CODES.RATE_LIMITED) || isAppError(error, ERROR_CODES.CANCELLED) || isAppError(error, ERROR_CODES.STORAGE_ERROR)) throw error;
+          errors.push(toErrorRecord(error, { pid, phase: 'hole' }));
         }
+        progressPids.add(pid);
+        await this.recordProgress(job, progressPids, errors, 'followed', pid);
+      });
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED, { errors });
+        return { job, paused: true };
       }
 
       for (const pid of basePids) references.delete(pid);
@@ -413,7 +459,7 @@ export class ExportJob {
           retryable: false,
         });
       }
-      const referencePids = [...references].slice(0, LIMITS.maxReferencedPids);
+      const referencePids = [...references].sort((a, b) => Number(a) - Number(b)).slice(0, LIMITS.maxReferencedPids);
       if (
         referencePids.length > LIMITS.confirmReferencedPids &&
         !options.confirmedLargeReferences
@@ -422,18 +468,17 @@ export class ExportJob {
         if (!confirmed) referencePids.length = 0;
       }
       job.total += referencePids.length;
+      for (const pid of referencePids) {
+        if (completedPids.has(pid)) progressPids.add(pid);
+      }
+      job.completed = progressPids.size;
       await this.store.putJob(job);
 
-      for (const pid of referencePids) {
-        throwIfAborted(signal, 'export_references');
-        if (this.pauseRequested) {
-          await this.saveState(job, JOB_STATES.PAUSED, { errors });
-          return { job, paused: true };
-        }
-        if (completedPids.has(pid) && !options.includeMedia) continue;
+      await this.runWorkers(referencePids, signal, async (pid) => {
+        if (completedPids.has(pid) && !options.includeMedia) return;
         try {
-          const hole = this.existingItems.get(pid)?.detailComplete
-            ? this.existingItems.get(pid).hole : await this.api.getHole(pid, signal);
+          const saved = this.existingItems.get(pid);
+          const hole = saved?.detailComplete ? saved.hole : await this.api.getHole(pid, signal, { shouldPause: () => this.pauseRequested });
           const itemErrors = await this.processHole({
             job,
             hole,
@@ -445,23 +490,29 @@ export class ExportJob {
           errors.push(...itemErrors);
           completedPids.add(pid);
         } catch (error) {
+          if (isAppError(error, ERROR_CODES.PAUSED)) return;
           if (
             isAppError(error, ERROR_CODES.UNAUTHORIZED) ||
             isAppError(error, ERROR_CODES.RATE_LIMITED) ||
             isAppError(error, ERROR_CODES.CANCELLED) ||
-            isAppError(error, ERROR_CODES.PAUSED) ||
             isAppError(error, ERROR_CODES.STORAGE_ERROR)
           ) {
             throw error;
           }
           errors.push(toErrorRecord(error, { pid, phase: 'referenced' }));
         }
-        job.completed = completedPids.size;
-        await this.store.putJob({ ...job, completed: job.completed, errors });
-        this.emit({ ...job, type: 'progress', phase: 'referenced', pid });
+        progressPids.add(pid);
+        await this.recordProgress(job, progressPids, errors, 'referenced', pid);
+      });
+      if (this.pauseRequested) {
+        await this.saveState(job, JOB_STATES.PAUSED, { errors });
+        return { job, paused: true };
       }
 
-      const items = await this.store.getItems(job.id);
+      const order = new Map([...basePids, ...referencePids].map((pid, index) => [pid, index]));
+      const items = (await this.store.getItems(job.id))
+        .filter((item) => order.has(item.pid))
+        .sort((a, b) => order.get(a.pid) - order.get(b.pid));
       const media = options.includeMedia ? await prepareExportMedia(this.store, job.id, items) : null;
       if (media) errors.push(...media.errors);
       const complete = plan.complete && errors.length === 0 && items.every((item) => item.fetchStatus === 'ok');

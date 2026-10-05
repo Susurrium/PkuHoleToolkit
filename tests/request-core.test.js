@@ -72,7 +72,7 @@ test('401 stops immediately without retry', async () => {
   assert.equal(calls, 1);
 });
 
-test('a second 429 pauses the job', async () => {
+test('three rate-limited attempts pause the job', async () => {
   let calls = 0;
   const scheduler = new RequestScheduler({
     fetchImpl: async () => {
@@ -86,7 +86,7 @@ test('a second 429 pauses the job', async () => {
     scheduler.requestJson('https://example.test'),
     (error) => error.code === ERROR_CODES.RATE_LIMITED,
   );
-  assert.equal(calls, 2);
+  assert.equal(calls, 3);
 });
 
 test('PID validation blocks path and query injection', () => {
