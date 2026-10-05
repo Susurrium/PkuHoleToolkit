@@ -4,7 +4,7 @@
 
 Toolkit 是运行在[树洞网页版](https://treehole.pku.edu.cn/web/)中的用户脚本。安装油猴和 Toolkit 后即可使用，无需编程或部署服务；本地备份和关注迁移都能独立完成。[PkuHoleStudio](https://github.com/Susurrium/PkuHoleStudio) 是可选的桌面端联动。
 
-**[安装 v1.5.0](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.5.0/PKU-Hole%20export%20tool.user.js)** · [正式版下载与更新记录](https://github.com/Susurrium/PkuHoleToolkit/releases/latest) · [反馈问题](https://github.com/Susurrium/PkuHoleToolkit/issues)
+**[安装 v1.6.0](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.6.0/PKU-Hole%20export%20tool.user.js)** · [正式版下载与更新记录](https://github.com/Susurrium/PkuHoleToolkit/releases/latest) · [反馈问题](https://github.com/Susurrium/PkuHoleToolkit/issues)
 
 第一次使用请从[安装与首次使用](#安装与首次使用)开始；想阅读或修改代码，可以直接跳到[开发与贡献](#开发与贡献)。
 
@@ -41,9 +41,9 @@ Toolkit 是运行在[树洞网页版](https://treehole.pku.edu.cn/web/)中的用
 
 ### 2. 安装 Toolkit
 
-打开 **[Toolkit v1.5.0 安装链接](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.5.0/PKU-Hole%20export%20tool.user.js)**，在脚本管理器弹出的页面中确认安装。
+打开 **[Toolkit v1.6.0 安装链接](https://raw.githubusercontent.com/Susurrium/PkuHoleToolkit/v1.6.0/PKU-Hole%20export%20tool.user.js)**，在脚本管理器弹出的页面中确认安装。
 
-如果没有弹出安装页面，可以到[正式版发布页](https://github.com/Susurrium/PkuHoleToolkit/releases/latest)下载附件 `PkuHoleToolkit-1.5.0.user.js`，然后通过脚本管理器的文件导入功能安装。不要下载名为 `Source code` 的源码包来安装。
+如果没有弹出安装页面，可以到[正式版发布页](https://github.com/Susurrium/PkuHoleToolkit/releases/latest)下载附件 `PkuHoleToolkit-1.6.0.user.js`，然后通过脚本管理器的文件导入功能安装。不要下载名为 `Source code` 的源码包来安装。
 
 升级或替换旧脚本后，请确认同类树洞导出脚本只启用一个，避免重复运行。脚本管理器中的中文名称是“北大树洞本地备份与关注迁移工具”，英文名称是 `PKU-Hole export tool`。
 
@@ -184,7 +184,7 @@ npm run check
 | 模块 | 职责 |
 | --- | --- |
 | [`main.js`](./apps/userscript/src/main.js)、[`credentials.js`](./apps/userscript/src/credentials.js) | 启动、当前登录凭据与账号绑定 |
-| [`api.js`](./apps/userscript/src/api.js)、[`scheduler.js`](./apps/userscript/src/scheduler.js) | 官方接口、串行请求、限速、重试与取消 |
+| [`api.js`](./apps/userscript/src/api.js)、[`scheduler.js`](./apps/userscript/src/scheduler.js) | 官方接口、并发读取、分页、限速、重试与取消 |
 | [`export-job.js`](./apps/userscript/src/export-job.js)、[`media.js`](./apps/userscript/src/media.js) | 范围、详情与评论抓取、引用补全、图片获取与校验 |
 | [`storage.js`](./apps/userscript/src/storage.js) | IndexedDB 断点和图片缓存 |
 | [`archive.js`](./apps/userscript/src/archive.js)、[`zip.js`](./apps/userscript/src/zip.js) | 归档、阅读文本与 ZIP 读写 |
