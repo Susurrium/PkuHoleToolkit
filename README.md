@@ -207,4 +207,4 @@ npm run check
 - [CHANGELOG](./CHANGELOG.md) 与 [GitHub Releases](https://github.com/Susurrium/PkuHoleToolkit/releases)：版本变化和可安装脚本。
 - [v1.3.0 Beta 验收记录](./BETA_TEST_CHECKLIST.md)与[早期方案](./方案设计.md)：历史资料，不作为当前安装指南或开发路线图。
 
-项目使用 [MIT License](./LICENSE)，原始作者 WindMan，后续由 Susurrium 等贡献者维护。感谢 Arthals 的油猴安装图文教程。
+本项目采用 [MIT License](./LICENSE) 开源。感谢 Arthals 提供的油猴安装图文教程。
