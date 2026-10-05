@@ -8,6 +8,7 @@ export const ERROR_CODES = Object.freeze({
   BUSINESS_ERROR: 'business_error',
   UNKNOWN_RESULT: 'unknown_result',
   CANCELLED: 'cancelled',
+  PAUSED: 'paused',
   INVALID_INPUT: 'invalid_input',
   STORAGE_ERROR: 'storage_error',
 });
